@@ -63,7 +63,8 @@ def gpu_count():
         return 0
 
 
-def load_config(path):
+def load_config(path, gpu_slots=None):
+    """gpu_slots：同时运行的 GPU 任务数（run_all.py 的 GPU 槽位数），默认每张卡一个"""
     cfg = _load_with_base(path)
     cfg.config_path = path
     # 环境变量 ETHC_OUTPUTS 可把模型检查点放到别处（例如不在云同步目录里），结果文件仍按配置存放
@@ -71,7 +72,7 @@ def load_config(path):
         cfg.paths.outputs = os.path.join(os.environ['ETHC_OUTPUTS'], cfg.name)
     # 元启发式的并行进程数：auto = 可用核数 - 每个 GPU 任务 2 个核 - 2 个余量
     if str(cfg.solvers.workers) == 'auto':
-        cfg.solvers.workers = max(1, available_cpus() - 2 * gpu_count() - 2)
+        cfg.solvers.workers = max(1, available_cpus() - 2 * (gpu_slots or gpu_count()) - 2)
     return cfg
 
 

@@ -12,6 +12,7 @@ GPU 任务在 --gpus 列出的每张卡上各跑一个；CPU 任务（元启发�
 其他用法：
     --dry-run              列出全部任务及其状态，不运行
     --only train,eval      只运行这些阶段（data/probe/calibrate/train/eval/solve/timing/equal_time/analysis）
+    --tasks-per-gpu K      每张卡同时运行 K 个 GPU 任务（小模型的训练受 CPU 发起计算的速度限制，单个任务用不满 GPU）
     --task ID              只运行一个任务（供 Slurm 作业数组使用）
     --emit-slurm DIR       为算力中心生成 Slurm 作业脚本（每个阶段一个作业数组，按阶段依赖提交）
 """
@@ -214,13 +215,22 @@ def main():
     parser.add_argument('--gpus', default='0',
                         help="Comma-separated GPU ids, one GPU task per entry (repeat an id to run two tasks on it), "
                              "or 'all' for every visible GPU")
+    parser.add_argument('--tasks-per-gpu', type=int, default=1,
+                        help='GPU tasks run concurrently on each GPU (small models leave the GPU partly idle)')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--task', default=None, help='Run a single task id')
     parser.add_argument('--emit-slurm', default=None, metavar='DIR')
     opts = parser.parse_args()
     sys.stdout.reconfigure(line_buffering=True)  # nohup 重定向到文件时也逐行写出进度
 
-    cfg = load_config(opts.config)
+    if opts.gpus == 'all':
+        from experiments import gpu_count
+        gpu_ids = [str(i) for i in range(max(1, gpu_count()))]
+    else:
+        gpu_ids = [g for g in opts.gpus.split(',') if g != '']
+    # GPU 槽位：每张卡 tasks-per-gpu 个，按轮次交错排列，使最先派发的长任务分散到不同的卡上
+    gpus = [g for _ in range(opts.tasks_per_gpu) for g in gpu_ids]
+    cfg = load_config(opts.config, gpu_slots=len(gpus))
     tasks = build_tasks(cfg)
     selected = set(opts.only.split(',')) if opts.only else set(STAGES)
     print('Config {}: {} tasks'.format(opts.config, len(tasks)))
@@ -241,11 +251,6 @@ def main():
         emit_slurm(cfg, tasks, selected, opts.emit_slurm, opts.config)
         return
 
-    if opts.gpus == 'all':
-        from experiments import gpu_count
-        gpus = [str(i) for i in range(max(1, gpu_count()))]
-    else:
-        gpus = [g for g in opts.gpus.split(',') if g != '']
     print('GPU slots: {}; metaheuristic workers: {}'.format(','.join(gpus), cfg.solvers.workers))
     failed = run(cfg, tasks, selected, gpus)
     print_status(tasks, selected)
