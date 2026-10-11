@@ -17,7 +17,7 @@ import os
 import sys
 from collections import defaultdict
 
-from experiments import load_config, build_tasks, eval_out, time_limit, MAIN_LAMBDA
+from experiments import load_config, build_tasks, eval_out, time_limit, auto_workers, threads_per_core, MAIN_LAMBDA
 
 VARIANT_NAMES = {'ethc': 'ETHC-VRC', 'ethc_woet': 'ETHC-VRC w/o ET', 'tpa': 'TPA-Reward', 'mvmoe': 'MVMoE',
                  'ortools': 'OR-Tools', 'ortools_eq': 'OR-Tools（等时）', 'ts': 'TS', 'ba': 'BA'}
@@ -171,8 +171,9 @@ def main():
     parser.add_argument('--gpus', default='1',
                         help='Comma-separated GPU counts to estimate (GPUs of the same model as the probe GPU), e.g. 1,2,4,8')
     parser.add_argument('--cpus-per-gpu', type=int, default=None,
-                        help='CPU cores per rented GPU (AutoDL allocates CPUs per GPU); metaheuristic workers are then '
-                             'cores - 2 x GPUs - 2 as with workers: auto. Default: the workers of the paper config')
+                        help='CPU threads (vCPUs) per rented GPU (AutoDL allocates CPUs per GPU); metaheuristic workers '
+                             'are then computed as with workers: auto (physical cores minus one per GPU task, minus one). '
+                             'Default: the workers of the paper config')
     parser.add_argument('--price', type=float, default=None, help='Rental price per GPU-hour (yuan), for a cost estimate')
     parser.add_argument('--tasks-per-gpu', type=int, default=1, help='GPU tasks run concurrently on each GPU (run_all.py option)')
     parser.add_argument('--gain', default=None,
@@ -188,7 +189,7 @@ def main():
     def workers_for(n_gpus):
         if opts.cpus_per_gpu is None:
             return paper.solvers.workers
-        return max(1, opts.cpus_per_gpu * n_gpus - 2 * n_gpus * per_gpu - 2)
+        return auto_workers(opts.cpus_per_gpu * n_gpus, n_gpus * per_gpu, threads_per_core())
 
     lines = ['# 正式运行时长估算', '',
              '依据冒烟阶段测得的计时（GPU：{}；元启发式时限：{}）。GPU·h 为单卡串行时长；CPU·h 为单核时长。'.format(

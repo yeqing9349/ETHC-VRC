@@ -1,7 +1,7 @@
 # 在 AutoDL 等租用的多卡服务器上运行正式实验：设置与 paper.yaml 完全相同，只有两处按服务器调整——
 #   1) 元启发式在服务器的 CPU 上运行，时限也在这台机器上标定（autodl_smoke.yaml 的冒烟阶段完成标定）；
-#   2) 并行进程数按容器的 CPU 配额自动确定（可用核数 - 每个 GPU 任务 2 个核 - 2）。
-# 运行：python run_all.py --config configs/autodl.yaml --gpus all
+#   2) 并行进程数按容器的 CPU 配额自动确定：按物理核计（超线程的两个线程算一个核），每个 GPU 任务占一个，再留一个余量。
+# 运行：python run_all.py --config configs/autodl.yaml --gpus all --tasks-per-gpu 2
 base: paper.yaml
 
 solvers:

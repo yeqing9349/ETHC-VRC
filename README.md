@@ -46,12 +46,15 @@ bash /root/autodl-tmp/ETHC-VRC/scripts/autodl_setup.sh
 source /root/autodl-tmp/venv/bin/activate && cd /root/autodl-tmp/ETHC-VRC
 
 # 2) 先租 1 张卡测速：冒烟测试 + 在服务器 CPU 上标定元启发式时限，再估算不同卡数的时长与费用
-#    （--cpus-per-gpu 为每张卡分配的 CPU 核数，--price 为每卡每小时的租金）
+#    （--cpus-per-gpu 为每张卡分配的 CPU 线程数，--price 为每卡每小时的租金；--gain 为每卡同时运行 2 个训练任务时
+#    相对单个任务的吞吐倍数，RTX 5090 上实测 n=20/50/100 分别约为 1.64/1.55/1.37）
 python run_all.py --config configs/autodl_smoke.yaml --gpus all
-python estimate.py --paper configs/autodl.yaml --smoke configs/autodl_smoke.yaml --gpus 1,2,4,8 --cpus-per-gpu 25 --price 2.78
+python estimate.py --paper configs/autodl.yaml --smoke configs/autodl_smoke.yaml --gpus 1,2,4,8 --cpus-per-gpu 25 \
+    --price 2.78 --tasks-per-gpu 2 --gain 20:1.64,50:1.55,100:1.37
 
-# 3) 正式运行（多卡机器上；断线或关机后重新运行同一命令即可续跑）
-nohup python run_all.py --config configs/autodl.yaml --gpus all > run_paper.log 2>&1 &
+# 3) 正式运行（多卡机器上；断线或关机后重新运行同一命令即可续跑）。小规模训练受 CPU 发起计算的速度限制，
+#    单个任务用不满 GPU，每张卡同时运行 2 个任务（两个 n=100 训练任务的显存合计约 27 GB；显存小于 32 GB 的卡用 1）
+nohup python run_all.py --config configs/autodl.yaml --gpus all --tasks-per-gpu 2 > run_paper.log 2>&1 &
 ```
 
 运行结束后取回 `results/paper/`（表2、图3–6、`paper_numbers.json` 与逐实例结果）；模型在 `outputs/paper/`。

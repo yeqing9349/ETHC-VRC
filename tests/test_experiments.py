@@ -6,7 +6,7 @@ from collections import Counter
 
 import pytest
 
-from experiments import load_config, build_tasks
+from experiments import load_config, build_tasks, auto_workers
 
 
 @pytest.fixture(scope='module')
@@ -64,3 +64,11 @@ def test_paper_settings(paper):
     assert '--samples 1280' in s and '--instances_per_pass 1' in s and '--modes soft hard' in s
     g = ' '.join(tasks['eval:ethc_n100_l3_s1234__test100__greedy_soft-hard'].cmd)
     assert '--eval_batch_size 1024' in g
+
+
+def test_auto_workers():
+    # 按物理核计：AutoDL 单卡 25 个超线程 → 12 个物理核，1 个 GPU 任务 → 10 个求解进程
+    assert auto_workers(25, 1, 2) == 10
+    assert auto_workers(200, 16, 2) == 83  # 8 卡、每卡 2 个 GPU 任务
+    assert auto_workers(12, 1, 1) == 10    # 无超线程
+    assert auto_workers(4, 8, 2) == 1      # 至少 1 个

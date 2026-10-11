@@ -54,6 +54,25 @@ def available_cpus():
         return os.cpu_count() or 1
 
 
+def threads_per_core():
+    """每个物理核的硬件线程数（开超线程时为 2）；读不到 CPU 拓扑时按 1 计"""
+    try:
+        siblings = open('/sys/devices/system/cpu/cpu0/topology/thread_siblings_list').read().strip()  # 如 "0,104" 或 "0-1"
+        n = 0
+        for part in siblings.split(','):
+            a, _, b = part.partition('-')
+            n += int(b) - int(a) + 1 if b else 1
+        return max(1, n)
+    except (OSError, ValueError):
+        return 1
+
+
+def auto_workers(cpus, gpu_slots, tpc):
+    """元启发式的并行进程数：按物理核计，每个 GPU 任务（受单线程发起计算的速度限制）占一个物理核，再留一个余量。
+    不按超线程计：两个求解进程共用一个物理核时各自只有约六成算力，同一时限下的解会变差，也与标定时限时的条件不一致。"""
+    return max(1, cpus // tpc - gpu_slots - 1)
+
+
 def gpu_count():
     import subprocess
     try:
@@ -70,9 +89,9 @@ def load_config(path, gpu_slots=None):
     # 环境变量 ETHC_OUTPUTS 可把模型检查点放到别处（例如不在云同步目录里），结果文件仍按配置存放
     if os.environ.get('ETHC_OUTPUTS'):
         cfg.paths.outputs = os.path.join(os.environ['ETHC_OUTPUTS'], cfg.name)
-    # 元启发式的并行进程数：auto = 可用核数 - 每个 GPU 任务 2 个核 - 2 个余量
+    # 元启发式的并行进程数：auto = 物理核数 - 每个 GPU 任务一个物理核 - 1 个余量（见 auto_workers）
     if str(cfg.solvers.workers) == 'auto':
-        cfg.solvers.workers = max(1, available_cpus() - 2 * (gpu_slots or gpu_count()) - 2)
+        cfg.solvers.workers = auto_workers(available_cpus(), gpu_slots or max(1, gpu_count()), threads_per_core())
     return cfg
 
 

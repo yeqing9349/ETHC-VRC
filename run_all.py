@@ -79,7 +79,7 @@ def launch(cfg, task, gpu=None):
     if gpu is not None:
         env['CUDA_VISIBLE_DEVICES'] = str(gpu)
     # 容器内 os.cpu_count() 是整台机器的核数（AutoDL 上为 208，而 CPU 配额只有 25），PyTorch 等库会按它开线程：
-    # 限制每个任务的计算线程数，GPU 任务 2 个（与 workers: auto 为每个 GPU 任务预留的核数一致），元启发式每个进程 1 个
+    # 限制每个任务的计算线程数，GPU 任务 2 个（workers: auto 为每个 GPU 任务预留一个物理核），元启发式每个进程 1 个
     threads = '2' if task.resource == 'gpu' else '1'
     for var in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMBA_NUM_THREADS'):
         env.setdefault(var, threads)
