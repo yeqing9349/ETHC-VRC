@@ -57,7 +57,7 @@ def test_paper_settings(paper):
     t = tasks['train:ethc_n100_l3_s1234']
     cmd = ' '.join(t.cmd)
     for arg in ('--epoch_size 1280000', '--batch_size 512', '--n_epochs 100', '--lr_model 0.0001',
-                '--bl_alpha 0.05', '--bl_warmup_epochs 0', '--penalty_lambda 3', '--seed 1234',
+                '--bl_alpha 0.05', '--bl_warmup_epochs 1', '--exp_beta 0.8', '--penalty_lambda 3', '--seed 1234',
                 '--n_encode_layers 3', '--n_heads 8', '--embedding_dim 128'):
         assert arg in cmd, arg
     s = ' '.join(tasks['eval:ethc_n100_l3_s1234__test100__sample_soft-hard_1280'].cmd)

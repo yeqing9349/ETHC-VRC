@@ -125,6 +125,16 @@ def test_sampling_repeats_embeddings():
     assert pi.size(0) == 32 and (n_late == 0).all()
 
 
+def test_warmup_baseline_resume():
+    """续训时按已完成的 epoch 恢复预热进度：预热 1 个 epoch 时，第 0 个 epoch 之后续训应直接用 rollout 基线"""
+    from reinforce_baselines import WarmupBaseline, NoBaseline
+    for n_epochs, last_epoch, alpha in ((1, 0, 1.0), (1, 5, 1.0), (2, 0, 0.5), (2, 1, 1.0)):
+        b = WarmupBaseline(NoBaseline(), n_epochs=n_epochs)
+        assert b.alpha == 0
+        b.resume(last_epoch)
+        assert b.alpha == alpha
+
+
 @pytest.mark.parametrize('model_name,mode', [('attention', 'soft'), ('attention', 'hard'), ('tpa', 'soft'),
                                              ('mvmoe', 'hard')])
 def test_eval_saves_tours_matching_metrics(model_name, mode):

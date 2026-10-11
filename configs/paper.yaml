@@ -25,7 +25,8 @@ train:                            # 论文第5.1.2节，DRL 方法共用
   lr: 1.0e-4
   max_grad_norm: 1.0
   bl_alpha: 0.05                  # rollout 基线的配对 t 检验显著性水平
-  bl_warmup_epochs: 0             # 算法2：从一开始就用贪心 rollout 基线
+  bl_warmup_epochs: 1             # 第一个 epoch 用指数移动平均基线预热，之后用贪心 rollout 基线（Kool et al. 的实现，与原始实验相同）
+  exp_beta: 0.8                   # 预热所用指数基线的衰减系数
   eval_batch_size: 1024
   log_step: 50
   tf32: false

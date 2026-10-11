@@ -68,6 +68,11 @@ class WarmupBaseline(Baseline):
             self.alpha = (epoch + 1) / float(self.n_epochs)
             print("Set warmup alpha = {}".format(self.alpha))
 
+    def resume(self, epoch):
+        """续训：检查点只含内层基线，不含预热进度，按已完成的最后一个 epoch（从 0 计）恢复 alpha。
+        否则在预热结束后续训时 alpha 停在 0，后续所有 epoch 都会误用指数基线"""
+        self.alpha = min(1.0, (epoch + 1) / float(self.n_epochs))
+
     def state_dict(self):
         # Checkpointing within warmup stage makes no sense, only save inner baseline
         return self.baseline.state_dict()

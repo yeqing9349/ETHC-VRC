@@ -216,7 +216,7 @@ def train_task(cfg, variant, size, lmbda, seed):
            '--val_dataset', cfg.data.val.format(size=size), '--val_size', str(t.val_size),
            '--n_epochs', str(t.n_epochs), '--epoch_size', str(t.epoch_size), '--batch_size', str(t.batch_size),
            '--lr_model', str(t.lr), '--max_grad_norm', str(t.max_grad_norm), '--bl_alpha', str(t.bl_alpha),
-           '--bl_warmup_epochs', str(t.bl_warmup_epochs), '--log_step', str(t.log_step),
+           '--bl_warmup_epochs', str(t.bl_warmup_epochs), '--exp_beta', str(t.exp_beta), '--log_step', str(t.log_step),
            '--eval_batch_size', str(t.eval_batch_size), '--no_progress_bar'] + MODEL_ARGS[variant]
     for k, v in cfg.models.get(variant, {}).items():
         cmd += ['--' + k, str(v)]

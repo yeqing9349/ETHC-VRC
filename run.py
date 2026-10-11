@@ -158,10 +158,14 @@ def run(opts):
             epoch_resume = int(os.path.splitext(os.path.split(opts.resume)[-1])[0].split("-")[1])
             baseline.epoch_callback(model, epoch_resume)
 
+        if isinstance(baseline, WarmupBaseline):
+            baseline.resume(epoch_resume)
+
         torch.set_rng_state(load_data['rng_state'])
         if opts.use_cuda:
             torch.cuda.set_rng_state_all(load_data['cuda_rng_state'])
-        print("Resuming after {}".format(epoch_resume))
+        print("Resuming after {}{}".format(
+            epoch_resume, ', warmup alpha = {}'.format(baseline.alpha) if isinstance(baseline, WarmupBaseline) else ''))
         opts.epoch_start = epoch_resume + 1
 
     csv_loggers = {
