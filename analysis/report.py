@@ -35,6 +35,7 @@ STYLE = {
 plt.rcParams.update({
     # Linux 服务器上通常没有 Times New Roman，用字宽相同的 Liberation Serif（apt 包 fonts-liberation）代替
     'font.family': 'serif', 'font.serif': ['Times New Roman', 'Liberation Serif', 'DejaVu Serif'], 'font.size': 11,
+    'mathtext.fontset': 'stix',  # 公式符号（如 λ）用与 Times 风格一致的 STIX 字体，而非默认的 DejaVu Sans
     'axes.edgecolor': INK_2, 'axes.labelcolor': INK, 'axes.linewidth': 0.8,
     'xtick.color': INK_2, 'ytick.color': INK_2, 'axes.grid': True, 'grid.color': GRID, 'grid.linewidth': 0.6,
     'grid.linestyle': '-', 'legend.frameon': False, 'legend.labelcolor': INK, 'savefig.bbox': 'tight',
