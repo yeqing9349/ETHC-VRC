@@ -12,7 +12,6 @@ import argparse
 import json
 import multiprocessing as mp
 import os
-import platform
 import time
 
 import numpy as np
@@ -102,6 +101,7 @@ def run(opts):
             print('{} {}: {}/{} instances, mean cost {:.4f}, {:.0f}s'.format(
                 opts.method, os.path.basename(opts.out), done, n_inst, np.nanmean(metrics[:done, 0]), wall))
 
+    from experiments import cpu_model  # 只在主进程中导入，求解子进程不需要
     summary = {
         'method': opts.method,
         'dataset': opts.dataset,
@@ -117,7 +117,7 @@ def run(opts):
         'extra_vehicle_instances': int((extra > 0).sum()),
         'mean_iterations': float(iterations.mean()),
         'time_s': {'total': wall, 'cpu_sum': float(inst_time.sum()), 'per_instance_mean': float(inst_time.mean())},
-        'device': platform.processor(),
+        'device': cpu_model(),
     }
     arrays = {'best_{}'.format(f): metrics[:, j] for j, f in enumerate(FIELDS)}
     arrays.update({'extra_vehicles': extra, 'iterations': iterations, 'inst_time': inst_time, 'sequences': sequences})

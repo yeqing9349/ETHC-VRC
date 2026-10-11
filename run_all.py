@@ -18,6 +18,7 @@ GPU 任务在 --gpus 列出的每张卡上各跑一个；CPU 任务（元启发�
     --emit-slurm DIR       为算力中心生成 Slurm 作业脚本（每个阶段一个作业数组，按阶段依赖提交）
 """
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -89,6 +90,21 @@ def launch(cfg, task, gpu=None):
     log.flush()
     proc = subprocess.Popen(resolve_cmd(cfg, task), stdout=log, stderr=subprocess.STDOUT, env=env)
     return proc, log
+
+
+def record_environment(cfg, gpus):
+    """把本次运行的硬件、配额与软件版本追加到 results/<配置名>/environment.json（论文 §5.1.3 据此书写）"""
+    from experiments import environment
+    path = os.path.join(cfg.paths.results, 'environment.json')
+    records = []
+    if os.path.isfile(path):
+        with open(path, encoding='utf-8') as f:
+            records = json.load(f)
+    records.append(dict(environment(len(gpus)), gpu_slot_ids=list(gpus), metaheuristic_workers=cfg.solvers.workers,
+                        config=cfg.config_path))
+    os.makedirs(cfg.paths.results, exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(records, f, indent=1, ensure_ascii=False)
 
 
 def print_status(tasks, selected):
@@ -258,6 +274,7 @@ def main():
         return
 
     print('GPU slots: {}; metaheuristic workers: {}'.format(','.join(gpus), cfg.solvers.workers))
+    record_environment(cfg, gpus)
     failed = run(cfg, tasks, selected, gpus)
     print_status(tasks, selected)
     if failed:

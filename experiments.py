@@ -73,6 +73,68 @@ def auto_workers(cpus, gpu_slots, tpc):
     return max(1, cpus // tpc - gpu_slots - 1)
 
 
+def cpu_model():
+    """CPU 型号（写入求解结果与运行环境记录）"""
+    try:
+        with open('/proc/cpuinfo') as f:
+            for line in f:
+                if line.startswith('model name'):
+                    return line.split(':', 1)[1].strip()
+    except OSError:
+        pass
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'HARDWARE\DESCRIPTION\System\CentralProcessor\0')
+        return winreg.QueryValueEx(key, 'ProcessorNameString')[0].strip()
+    except (ImportError, OSError):
+        import platform
+        return platform.processor()
+
+
+def memory_gb():
+    """可用内存（GB）：容器的 cgroup 内存上限，否则为整机内存；读不到时为 None"""
+    try:
+        limit = open('/sys/fs/cgroup/memory.max').read().strip()
+        if limit != 'max':
+            return round(int(limit) / 2 ** 30, 1)
+    except (OSError, ValueError):
+        pass
+    try:
+        for line in open('/proc/meminfo'):
+            if line.startswith('MemTotal'):
+                return round(int(line.split()[1]) / 2 ** 20, 1)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def environment(gpu_slots=None):
+    """运行环境：硬件、容器配额与软件版本（run_all.py 每次运行时追加到 results/<配置名>/environment.json，供论文 §5.1.3）"""
+    import platform
+    import socket
+    import subprocess
+    import time
+    from importlib import metadata
+    rec = {'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'host': socket.gethostname(), 'os': platform.platform(),
+           'python': platform.python_version(), 'cpu_model': cpu_model(), 'logical_cpus': os.cpu_count(),
+           'cpu_quota': available_cpus(), 'threads_per_core': threads_per_core(), 'memory_gb': memory_gb(),
+           'gpus': [], 'gpu_slots': gpu_slots}
+    try:
+        out = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total,driver_version', '--format=csv,noheader'],
+                             capture_output=True, text=True, timeout=30).stdout
+        rec['gpus'] = [line.strip() for line in out.splitlines() if line.strip()]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    versions = {}
+    for pkg in ('torch', 'numpy', 'scipy', 'numba', 'ortools', 'omegaconf'):
+        try:
+            versions[pkg] = metadata.version(pkg)
+        except metadata.PackageNotFoundError:
+            pass
+    rec['packages'] = versions
+    return rec
+
+
 def gpu_count():
     import subprocess
     try:

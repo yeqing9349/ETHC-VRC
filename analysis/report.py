@@ -110,6 +110,20 @@ def metrics_of(summary, key='best'):
     }
 
 
+def full_metrics(entry):
+    """输出解的指标、最多用车数；ETHC-VRC 另给每种掩码模式单独的指标与硬掩码解被选中的比例，
+    元启发式另给车队上限（12 辆）被用满的实例比例与补加车辆的实例数（检验车队上限不起限制作用）"""
+    summary, arrays = entry
+    m = dict(metrics_of(summary), max_vehicles=int(arrays['best_vehicles'].max()))
+    if len(summary.get('per_mode', {})) > 1:
+        m['per_mode'] = {mode: metrics_of(summary, mode) for mode in summary['per_mode']}
+        m['hard_selected_share'] = summary['mode_share'].get('hard')
+    if 'max_routes' in summary:
+        m['fleet_cap_share'] = float((arrays['best_vehicles'] >= summary['max_routes']).mean())
+        m['extra_vehicle_instances'] = summary.get('extra_vehicle_instances', 0)
+    return m
+
+
 # ---------------------------------------------------------------- 表2与正文统计
 # 最后一行是等时比较：OR-Tools 的单实例时限取 ETHC-VRC(S) 的实测每实例耗时
 TABLE2_ROWS = ('ETHC-VRC(G)', 'ETHC-VRC(S)', 'TPA-Reward(G)', 'MVMoE(G)', 'OR-Tools', 'TS', 'BA', 'OR-Tools (equal time)')
@@ -134,7 +148,7 @@ def table2(res, out_dir):
             if e is None:
                 continue
             summary, arrays = e
-            numbers.setdefault(row, {})[size] = dict(metrics_of(summary), time_s=summary['time_s']['total'])
+            numbers.setdefault(row, {})[size] = dict(full_metrics(e), time_s=summary['time_s']['total'])
             if 'time_limit_s' in summary:  # 元启发式：单实例时限与并行进程数
                 numbers[row][size].update(time_limit_s=summary['time_limit_s'], workers=summary['workers'])
             per_instance[(row, size)] = arrays['best_cost']
@@ -209,6 +223,7 @@ def figure3(res, out_dir):
     numbers = {}
     for size in cfg.sizes:
         series = {'ETHC-VRC(G)': [], 'ETHC-VRC(S)': [], 'TPA-Reward': [], 'OR-Tools': []}
+        details = {name: {} for name in series}  # 每个 λ 的路径长度、迟到与车辆数（混合成本之外的分项）
         for lmbda in cfg.lambdas:
             g = res.eval('ethc', size, lmbda, seed, size, 'greedy', ['soft', 'hard'])
             s = res.eval('ethc', size, lmbda, seed, size, 'sample', ['soft', 'hard'])
@@ -216,7 +231,10 @@ def figure3(res, out_dir):
             o = res.solve('ortools', size, lmbda)
             for name, e in (('ETHC-VRC(G)', g), ('ETHC-VRC(S)', s), ('TPA-Reward', t), ('OR-Tools', o)):
                 series[name].append(None if e is None else e[0]['best']['cost'])
-        numbers[size] = {name: dict(zip(map(fmt_lambda, cfg.lambdas), vals)) for name, vals in series.items()}
+                if e is not None:
+                    details[name][fmt_lambda(lmbda)] = full_metrics(e)
+        numbers[size] = {'cost': {name: dict(zip(map(fmt_lambda, cfg.lambdas), vals)) for name, vals in series.items()},
+                         'metrics': details}
         fig, ax = plt.subplots(figsize=(4.6, 3.6))
         for name, vals in series.items():
             xs = [l for l, v in zip(cfg.lambdas, vals) if v is not None]
@@ -239,14 +257,22 @@ def figure4(res, out_dir):
     numbers = {}
     for size in cfg.sizes:
         series = {'ETHC-VRC(G)': [], 'ETHC-VRC(S)': [], 'TPA-Reward': [], 'MVMoE': []}
+        details = {name: {} for name in series}
+        paired_g = {}  # ETHC-VRC(G) 对两个贪心基线的逐实例配对比较（每个训练—测试组合）
         for t in cfg.test_sizes:
-            entries = (('ETHC-VRC(G)', res.eval('ethc', size, MAIN_LAMBDA, seed, t, 'greedy', ['soft', 'hard'])),
-                       ('ETHC-VRC(S)', res.eval('ethc', size, MAIN_LAMBDA, seed, t, 'sample', ['soft', 'hard'])),
-                       ('TPA-Reward', res.eval('tpa', size, MAIN_LAMBDA, seed, t, 'greedy', ['soft'])),
-                       ('MVMoE', res.eval('mvmoe', size, MAIN_LAMBDA, seed, t, 'greedy', ['hard'])))
-            for name, e in entries:
+            entries = dict((('ETHC-VRC(G)', res.eval('ethc', size, MAIN_LAMBDA, seed, t, 'greedy', ['soft', 'hard'])),
+                            ('ETHC-VRC(S)', res.eval('ethc', size, MAIN_LAMBDA, seed, t, 'sample', ['soft', 'hard'])),
+                            ('TPA-Reward', res.eval('tpa', size, MAIN_LAMBDA, seed, t, 'greedy', ['soft'])),
+                            ('MVMoE', res.eval('mvmoe', size, MAIN_LAMBDA, seed, t, 'greedy', ['hard']))))
+            for name, e in entries.items():
                 series[name].append(None if e is None else e[0]['best']['cost'])
-        numbers[size] = {name: dict(zip(map(str, cfg.test_sizes), vals)) for name, vals in series.items()}
+                if e is not None:
+                    details[name][str(t)] = full_metrics(e)
+            if entries['ETHC-VRC(G)'] is not None:
+                paired_g[str(t)] = {base: paired(entries['ETHC-VRC(G)'][1]['best_cost'], entries[base][1]['best_cost'])
+                                    for base in ('TPA-Reward', 'MVMoE') if entries[base] is not None}
+        numbers[size] = {'cost': {name: dict(zip(map(str, cfg.test_sizes), vals)) for name, vals in series.items()},
+                         'metrics': details, 'G_vs_baselines': paired_g}
         fig, ax = plt.subplots(figsize=(4.6, 3.6))
         for name, vals in series.items():
             xs = [t for t, v in zip(cfg.test_sizes, vals) if v is not None]
@@ -361,11 +387,16 @@ def figure6(res, out_dir):
         fig.savefig(os.path.join(out_dir, 'Sample{}.pdf'.format(size)))
         plt.close(fig)
         med = np.median(data, 1)
+        q1, q3 = np.percentile(data, 25, 1), np.percentile(data, 75, 1)
+        low, high = q1 - 1.5 * (q3 - q1), q3 + 1.5 * (q3 - q1)  # 与箱线图的须一致（whis=1.5），须外的点为离群点
         numbers[size] = {'instances': int(len(data)), 'solutions_per_instance': int(data.shape[1]),
                          'median_per_instance': med.tolist(), 'min_per_instance': data.min(1).tolist(),
-                         'q1_per_instance': np.percentile(data, 25, 1).tolist(),
-                         'q3_per_instance': np.percentile(data, 75, 1).tolist(),
-                         'mean_per_instance': data.mean(1).tolist()}
+                         'q1_per_instance': q1.tolist(), 'q3_per_instance': q3.tolist(),
+                         'max_per_instance': data.max(1).tolist(), 'mean_per_instance': data.mean(1).tolist(),
+                         'outliers_low_per_instance': (data < low[:, None]).sum(1).tolist(),
+                         'outliers_high_per_instance': (data > high[:, None]).sum(1).tolist(),
+                         'median_per_mode': {mode: np.median(arrays[mode + '_kept_costs'], 1).tolist()
+                                             for mode in ('soft', 'hard')}}
     return numbers
 
 
@@ -393,6 +424,9 @@ def main():
     calibration = cfg.solvers.get('calibration')
     if calibration and os.path.isfile(calibration):
         numbers['solver_time_limits'] = _json(calibration)
+    environment = os.path.join(out_dir, 'environment.json')  # run_all.py 记录的各次运行的硬件与软件版本
+    if os.path.isfile(environment):
+        numbers['environment'] = _json(environment)
     numbers['sources'] = sorted(res.sources)
     numbers['missing'] = sorted(res.missing)
     with open(os.path.join(out_dir, 'paper_numbers.json'), 'w', encoding='utf-8') as f:

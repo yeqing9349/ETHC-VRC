@@ -6,7 +6,7 @@ from collections import Counter
 
 import pytest
 
-from experiments import load_config, build_tasks, auto_workers
+from experiments import load_config, build_tasks, auto_workers, environment
 
 
 @pytest.fixture(scope='module')
@@ -64,6 +64,12 @@ def test_paper_settings(paper):
     assert '--samples 1280' in s and '--instances_per_pass 1' in s and '--modes soft hard' in s
     g = ' '.join(tasks['eval:ethc_n100_l3_s1234__test100__greedy_soft-hard'].cmd)
     assert '--eval_batch_size 1024' in g
+
+
+def test_environment_record():
+    rec = environment(2)
+    assert rec['cpu_model'] and rec['logical_cpus'] >= 1 and rec['gpu_slots'] == 2
+    assert 'torch' in rec['packages'] and 'ortools' in rec['packages']
 
 
 def test_auto_workers():
