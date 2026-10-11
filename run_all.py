@@ -218,6 +218,7 @@ def main():
     parser.add_argument('--task', default=None, help='Run a single task id')
     parser.add_argument('--emit-slurm', default=None, metavar='DIR')
     opts = parser.parse_args()
+    sys.stdout.reconfigure(line_buffering=True)  # nohup 重定向到文件时也逐行写出进度
 
     cfg = load_config(opts.config)
     tasks = build_tasks(cfg)
