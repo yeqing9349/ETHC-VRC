@@ -12,6 +12,7 @@ GPU 任务在 --gpus 列出的每张卡上各跑一个；CPU 任务（元启发�
 其他用法：
     --dry-run              列出全部任务及其状态，不运行
     --only train,eval      只运行这些阶段（data/probe/calibrate/train/eval/solve/timing/equal_time/analysis）
+    --match REGEX          只运行 id 匹配该正则表达式的任务（例如先跑一个规模做试点）
     --tasks-per-gpu K      每张卡同时运行 K 个 GPU 任务（小模型的训练受 CPU 发起计算的速度限制，单个任务用不满 GPU）
     --task ID              只运行一个任务（供 Slurm 作业数组使用）
     --emit-slurm DIR       为算力中心生成 Slurm 作业脚本（每个阶段一个作业数组，按阶段依赖提交）
@@ -91,7 +92,8 @@ def launch(cfg, task, gpu=None):
 
 
 def print_status(tasks, selected):
-    counts = Counter((t.stage, is_done(t)) for t in tasks.values() if t.stage in selected)
+    """selected：选中的任务 id 集合"""
+    counts = Counter((t.stage, is_done(t)) for tid, t in tasks.items() if tid in selected)
     for stage in STAGES:
         done, pending = counts[(stage, True)], counts[(stage, False)]
         if done or pending:
@@ -99,10 +101,10 @@ def print_status(tasks, selected):
 
 
 def run(cfg, tasks, selected, gpus):
-    todo = {tid: t for tid, t in tasks.items() if t.stage in selected and not is_done(t)}
+    todo = {tid: t for tid, t in tasks.items() if tid in selected and not is_done(t)}
     # 汇总的依赖中有任务要运行时，汇总也要在其后重新运行
     for tid, t in tasks.items():
-        if t.meta.get('dep_markers') and t.stage in selected and any(d in todo for d in t.deps):
+        if t.meta.get('dep_markers') and tid in selected and any(d in todo for d in t.deps):
             todo[tid] = t
     failed = set()
     running = {}  # task id -> (proc, log, slot, start)
@@ -182,7 +184,7 @@ def emit_slurm(cfg, tasks, selected, out_dir, config_path):
     submit = ['#!/bin/bash', 'set -e', 'cd "$(dirname "$0")/{}"'.format(to_root)]
     written = []
     for stage in STAGES:
-        ids = [tid for tid, t in tasks.items() if t.stage == stage and stage in selected and not is_done(t)]
+        ids = [tid for tid, t in tasks.items() if t.stage == stage and tid in selected and not is_done(t)]
         if not ids:
             continue
         with open(os.path.join(out_dir, 'tasks_{}.txt'.format(stage)), 'w', encoding='utf-8', newline='\n') as f:
@@ -217,6 +219,8 @@ def main():
                              "or 'all' for every visible GPU")
     parser.add_argument('--tasks-per-gpu', type=int, default=1,
                         help='GPU tasks run concurrently on each GPU (small models leave the GPU partly idle)')
+    parser.add_argument('--match', default=None, metavar='REGEX',
+                        help='Only run tasks whose id matches this regular expression (e.g. a pilot subset)')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--task', default=None, help='Run a single task id')
     parser.add_argument('--emit-slurm', default=None, metavar='DIR')
@@ -232,7 +236,9 @@ def main():
     gpus = [g for _ in range(opts.tasks_per_gpu) for g in gpu_ids]
     cfg = load_config(opts.config, gpu_slots=len(gpus))
     tasks = build_tasks(cfg)
-    selected = set(opts.only.split(',')) if opts.only else set(STAGES)
+    stages = set(opts.only.split(',')) if opts.only else set(STAGES)
+    match = re.compile(opts.match) if opts.match else None
+    selected = {tid for tid, t in tasks.items() if t.stage in stages and (match is None or match.search(tid))}
     print('Config {}: {} tasks'.format(opts.config, len(tasks)))
     print_status(tasks, selected)
 
@@ -243,9 +249,9 @@ def main():
             return
         sys.exit(subprocess.call(resolve_cmd(cfg, t)))
     if opts.dry_run:
-        for t in tasks.values():
-            if t.stage in selected and not is_done(t):
-                print('  [{}] {}'.format(t.stage, t.id))
+        for tid, t in tasks.items():
+            if tid in selected and not is_done(t):
+                print('  [{}] {}'.format(t.stage, tid))
         return
     if opts.emit_slurm:
         emit_slurm(cfg, tasks, selected, opts.emit_slurm, opts.config)

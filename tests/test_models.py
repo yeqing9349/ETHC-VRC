@@ -123,3 +123,22 @@ def test_sampling_repeats_embeddings():
         _, pi = model.decode(rep_input, rep_emb)
         cost, _, lateness, n_late, _ = CVRPTW.get_costs(rep_input, pi)
     assert pi.size(0) == 32 and (n_late == 0).all()
+
+
+@pytest.mark.parametrize('model_name,mode', [('attention', 'soft'), ('attention', 'hard'), ('tpa', 'soft'),
+                                             ('mvmoe', 'hard')])
+def test_eval_saves_tours_matching_metrics(model_name, mode):
+    """评估器保存的解（访问序列，补 0 到同一宽度）重算出的逐实例指标与它记录的指标一致"""
+    import eval as evaluator
+    model = make_model(args(model_name), CVRPTW).to(DEVICE).eval()
+    input = batch(20, size=10)
+    opts = argparse.Namespace(eval_batch_size=4, samples=8, instances_per_pass=2, seed=1234)
+    for strategy in ('greedy', 'sample'):
+        if strategy == 'greedy':
+            metrics, tours = evaluator.eval_greedy(model, input, 10, mode, opts)
+        else:
+            metrics, _, tours = evaluator.eval_sample(model, input, 10, mode, opts)
+        width = max(t.size(1) for t in tours) + 3  # 多补几个 0，检查补 0 不改变指标
+        pi = torch.from_numpy(evaluator.stack_tours(tours, width).astype('int64')).to(DEVICE)
+        assert pi.shape == (10, width)
+        assert torch.allclose(evaluator._metrics(CVRPTW, input, pi), metrics, atol=1e-5)

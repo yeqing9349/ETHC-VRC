@@ -4,7 +4,8 @@
 - greedy：每种掩码模式各做一次贪心解码，实例按每批 eval_batch_size(=1024) 个处理；
 - sample：每种掩码模式下，每个实例的 samples(=1280) 个样本在一次批量前向中完成；
 多种模式时逐实例保留混合成本最低的解；计时为整个测试集的总耗时，包含所有模式。
-输出 <out>.npz（逐实例结果）和 <out>.json（汇总指标与计时）。
+输出 <out>.npz（逐实例结果：各模式与所选解的指标和解本身，即访问序列）和 <out>.json（汇总指标与计时）。
+访问序列与元启发式的格式相同：各路径的客户依次排列，路径之间为仓库 0，末尾补 0。
 """
 import argparse
 import json
@@ -43,26 +44,27 @@ def set_mode(model, decode_type, mask_mode):
 
 
 def eval_greedy(model, data, n, mask_mode, opts):
-    """一次贪心解码，返回 (n, 5) 逐实例指标"""
+    """一次贪心解码，返回 (n, 5) 逐实例指标与各批的访问序列（留在 GPU 上，计时结束后再用 stack_tours 合并）"""
     set_mode(model, 'greedy', mask_mode)
-    out = []
+    out, tours = [], []
     with torch.no_grad():
         for start in range(0, n, opts.eval_batch_size):
             batch = _slice(data, start, min(start + opts.eval_batch_size, n))
             _, pi = model.decode(batch, model.encode(batch))
             out.append(_metrics(model.problem, batch, pi))
-    return torch.cat(out, 0)
+            tours.append(pi)
+    return torch.cat(out, 0), tours
 
 
 def eval_sample(model, data, n, mask_mode, opts, keep=0):
     """
-    每个实例采样 opts.samples 次，保留混合成本最低的样本，返回 (n, 5) 逐实例指标；
-    keep>0 时另外返回前 keep 个实例全部样本的混合成本 (keep, samples)，用于图6
+    每个实例采样 opts.samples 次，保留混合成本最低的样本，返回 (n, 5) 逐实例指标、
+    keep>0 时前 keep 个实例全部样本的混合成本 (keep, samples)（用于图6），以及所保留样本的访问序列
     """
     set_mode(model, 'sampling', mask_mode)
     torch.manual_seed(opts.seed)
     k = opts.instances_per_pass
-    best, kept = [], []
+    best, kept, tours = [], [], []
     with torch.no_grad():
         for start in range(0, n, k):
             batch = _slice(data, start, min(start + k, n))
@@ -72,10 +74,22 @@ def eval_sample(model, data, n, mask_mode, opts, keep=0):
             _, pi = model.decode(rep_batch, rep_embeddings)
             metrics = _metrics(model.problem, rep_batch, pi).view(opts.samples, m, len(FIELDS))
             idx = metrics[:, :, 0].argmin(0)
-            best.append(metrics[idx, torch.arange(m, device=idx.device)])
+            rows = torch.arange(m, device=idx.device)
+            best.append(metrics[idx, rows])
+            tours.append(pi.view(opts.samples, m, -1)[idx, rows])  # 样本按 do_batch_rep 的顺序排列：第 s 个样本在第 s 块
             if start < keep:
                 kept.append(metrics[:, :, 0].t()[:max(0, keep - start)])
-    return torch.cat(best, 0), (torch.cat(kept, 0) if kept else None)
+    return torch.cat(best, 0), (torch.cat(kept, 0) if kept else None), tours
+
+
+def stack_tours(tours, width):
+    """各批访问序列（长度不一）末尾补 0 到同一宽度，合并为 int16 数组"""
+    out = np.zeros((sum(t.size(0) for t in tours), width), dtype=np.int16)
+    row = 0
+    for t in tours:
+        out[row:row + t.size(0), :t.size(1)] = t.cpu().numpy()
+        row += t.size(0)
+    return out
 
 
 def summarize(metrics, problem_penalty):
@@ -121,24 +135,27 @@ def run(opts):
                 eval_sample(model, warm, 2, mode, warm_opts)
         _sync(device)
 
-    per_mode, times, kept = {}, {}, {}
+    per_mode, times, kept, tours = {}, {}, {}, {}
     for mode in opts.modes:
         _sync(device)
         t0 = time.perf_counter()
         if opts.strategy == 'greedy':
-            m = eval_greedy(model, data, n, mode, opts)
+            m, tours[mode] = eval_greedy(model, data, n, mode, opts)
         else:
-            m, kept_costs = eval_sample(model, data, n, mode, opts, keep=opts.keep_samples)
+            m, kept_costs, tours[mode] = eval_sample(model, data, n, mode, opts, keep=opts.keep_samples)
             if kept_costs is not None:
                 kept[mode] = kept_costs.cpu().numpy()
         _sync(device)
         times[mode] = time.perf_counter() - t0
         per_mode[mode] = m.cpu().numpy()
+    width = max(t.size(1) for mode_tours in tours.values() for t in mode_tours)
+    tours = {mode: stack_tours(mode_tours, width) for mode, mode_tours in tours.items()}
 
     # 逐实例保留混合成本较低的模式（成本相同时取列表中靠前的模式，即soft）
     stacked = np.stack([per_mode[mode] for mode in opts.modes], 0)  # (n_modes, n, 5)
     best_mode = stacked[:, :, 0].argmin(0)
     best = stacked[best_mode, np.arange(n)]
+    best_tours = np.stack([tours[mode] for mode in opts.modes], 0)[best_mode, np.arange(n)]
 
     summary = {
         'model': opts.model,
@@ -166,6 +183,8 @@ def run(opts):
     arrays = {f'{mode}_{field}': per_mode[mode][:, j] for mode in opts.modes for j, field in enumerate(FIELDS)}
     arrays.update({f'best_{field}': best[:, j] for j, field in enumerate(FIELDS)})
     arrays['best_mode'] = best_mode
+    arrays.update({f'{mode}_tours': tours[mode] for mode in opts.modes})
+    arrays['best_tours'] = best_tours
     arrays.update({f'{mode}_kept_costs': v for mode, v in kept.items()})
     np.savez_compressed(opts.out + '.npz', **arrays)
     with open(opts.out + '.json', 'w', encoding='utf-8') as f:
