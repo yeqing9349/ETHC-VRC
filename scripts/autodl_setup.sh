@@ -42,5 +42,11 @@ uv export --frozen --no-dev --no-hashes --format requirements-txt | grep -v '^-'
 VIRTUAL_ENV="$VENV" uv pip install -r /tmp/ethc_requirements.txt \
     --index-url "$PYPI_MIRROR" --find-links "$WHEELS" --index-strategy unsafe-best-match
 
+# 4) 作图字体：Linux 上通常没有 Times New Roman，安装字宽相同的 Liberation Serif
+if ! fc-list 2>/dev/null | grep -q "Liberation Serif"; then
+    (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fonts-liberation) >/dev/null 2>&1 \
+        || echo "未能安装 fonts-liberation，图中字体将用 DejaVu Serif"
+fi
+
 "$VENV/bin/python" -c "import torch; print('torch', torch.__version__, 'CUDA', torch.version.cuda, torch.cuda.is_available(), [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])"
 echo "环境就绪：source $VENV/bin/activate && cd $REPO"

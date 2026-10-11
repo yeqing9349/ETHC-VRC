@@ -33,7 +33,8 @@ STYLE = {
     'w/o ET': dict(color='#008300', marker=None),
 }
 plt.rcParams.update({
-    'font.family': 'serif', 'font.serif': ['Times New Roman', 'DejaVu Serif'], 'font.size': 11,
+    # Linux 服务器上通常没有 Times New Roman，用字宽相同的 Liberation Serif（apt 包 fonts-liberation）代替
+    'font.family': 'serif', 'font.serif': ['Times New Roman', 'Liberation Serif', 'DejaVu Serif'], 'font.size': 11,
     'axes.edgecolor': INK_2, 'axes.labelcolor': INK, 'axes.linewidth': 0.8,
     'xtick.color': INK_2, 'ytick.color': INK_2, 'axes.grid': True, 'grid.color': GRID, 'grid.linewidth': 0.6,
     'grid.linestyle': '-', 'legend.frameon': False, 'legend.labelcolor': INK, 'savefig.bbox': 'tight',
