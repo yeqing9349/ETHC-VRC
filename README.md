@@ -45,9 +45,10 @@ git clone -b paper-repro https://github.com/yeqing9349/ETHC-VRC.git /root/autodl
 bash /root/autodl-tmp/ETHC-VRC/scripts/autodl_setup.sh
 source /root/autodl-tmp/venv/bin/activate && cd /root/autodl-tmp/ETHC-VRC
 
-# 2) 先租 1 张卡测速：冒烟测试 + 在服务器 CPU 上标定元启发式时限，再估算 N 张卡的时长与费用
+# 2) 先租 1 张卡测速：冒烟测试 + 在服务器 CPU 上标定元启发式时限，再估算不同卡数的时长与费用
+#    （--cpus-per-gpu 为每张卡分配的 CPU 核数，--price 为每卡每小时的租金）
 python run_all.py --config configs/autodl_smoke.yaml --gpus all
-python estimate.py --paper configs/autodl.yaml --smoke configs/autodl_smoke.yaml --gpus 8 --price 2.78
+python estimate.py --paper configs/autodl.yaml --smoke configs/autodl_smoke.yaml --gpus 1,2,4,8 --cpus-per-gpu 25 --price 2.78
 
 # 3) 正式运行（多卡机器上；断线或关机后重新运行同一命令即可续跑）
 nohup python run_all.py --config configs/autodl.yaml --gpus all > run_paper.log 2>&1 &
