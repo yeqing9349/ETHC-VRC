@@ -1,0 +1,9 @@
+# AutoDL 服务器上的冒烟测试：与 smoke.yaml 相同，另在服务器 CPU 上标定元启发式时限（供 autodl.yaml 读取），
+# 并测出这台机器的训练与评估耗时，estimate.py 据此估算正式运行的时长与费用。
+# 运行：python run_all.py --config configs/autodl_smoke.yaml --gpus all
+#       python estimate.py --paper configs/autodl.yaml --smoke configs/autodl_smoke.yaml --gpus <卡数>
+base: smoke.yaml
+
+solvers:
+  workers: auto
+  calibration: results/calibration/time_limits_autodl.json

@@ -1,3 +1,22 @@
+import csv
+import os
+
+
+class CsvLogger(object):
+    """把一行行的指标追加写入CSV文件（续训时接着写），用于训练曲线和验证记录"""
+
+    def __init__(self, path, fields):
+        self.path = path
+        self.fields = list(fields)
+        if not os.path.isfile(path):
+            with open(path, 'w', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerow(self.fields)
+
+    def log(self, row):
+        with open(self.path, 'a', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow(['' if row.get(k) is None else row.get(k) for k in self.fields])
+
+
 def log_values(cost, grad_norms, epoch, batch_id, step,
                log_likelihood, reinforce_loss, bl_loss, tb_logger, opts, violated_time_num=None, violated_node_num=None, route_length=None):
     avg_cost = cost.mean().item()
@@ -15,7 +34,7 @@ def log_values(cost, grad_norms, epoch, batch_id, step,
     print('grad_norm: {}, clipped: {}'.format(grad_norms[0], grad_norms_clipped[0]))
 
     # Log values to tensorboard
-    if not opts.no_tensorboard:
+    if tb_logger is not None:
         tb_logger.log_value('avg_cost', avg_cost, step)
 
         tb_logger.log_value('actor_loss', reinforce_loss.item(), step)

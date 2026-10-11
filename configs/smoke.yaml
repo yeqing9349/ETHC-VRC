@@ -1,0 +1,42 @@
+# 冒烟测试：用极小的设置把 paper.yaml 的全部阶段端到端跑通，同时做三件决策需要的事：
+#   1) 计时探针：各模型 × 各训练规模在 batch 512 下的每次迭代耗时、显存，以及评估耗时；
+#   2) 元启发式时限标定（结果写到 solvers.calibration，正式运行直接读取）；
+#   3) estimate.py 据此估算正式运行的 GPU·h 与 CPU·h。
+# 运行：uv run python run_all.py --config configs/smoke.yaml && uv run python estimate.py
+base: paper.yaml
+name: smoke
+
+paths:
+  outputs: outputs/smoke
+  results: results/smoke
+
+data:
+  num_test: 64
+
+lambdas: [1, 3]
+seeds: [1234, 1235]
+
+train:
+  n_epochs: 2
+  epoch_size: 2048
+  val_size: 512
+  log_step: 1                     # 每步记录，使冒烟阶段的训练曲线图也有内容
+
+eval:
+  samples: 32
+  fig6_instances: 3
+
+solvers:
+  time_limit: 0.5                 # 冒烟只验证流程，用固定的短时限
+  num_instances: 16
+  run_calibration: true           # 但照常标定正式运行的时限
+
+probes:                           # 训练计时探针（不保存模型）
+  - {variants: [ethc, ethc_woet, tpa, mvmoe], sizes: [20, 50, 100], steps: 20, epoch_size: 1280000, val_size: 10000, n_epochs: 100, tf32: false}
+  - {variants: [ethc, ethc_woet, tpa, mvmoe], sizes: [20, 50, 100], steps: 20, epoch_size: 1280000, val_size: 10000, n_epochs: 100, tf32: true}
+
+eval_probes:                      # 评估计时探针（用冒烟训练出的模型，权重不影响耗时）
+  greedy_num: 10000
+  test_sizes: [20, 30, 50, 70, 100]
+  samples: 1280
+  sample_num: 20

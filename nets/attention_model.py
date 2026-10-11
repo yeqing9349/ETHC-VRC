@@ -53,7 +53,9 @@ class AttentionModel(nn.Module):
                  normalization='batch', # 归一化类型
                  n_heads=8, # 多头注意力机制中的头数
                  checkpoint_encoder=False, # 是否检查点编码器
-                 shrink_size=None): # 缩小大小以节省内存
+                 shrink_size=None, # 缩小大小以节省内存
+                 use_time_state=True, # CVRPTW：解码上下文是否包含显式时间状态(T_a, S_v)，False即消融实验中的w/o ET
+                 time_state='paper'): # CVRPTW：'paper'按算法1维护T_a；'legacy'复刻旧版实现，仅用于加载旧模型做回归检验
         super(AttentionModel, self).__init__()
 
         self.embedding_dim = embedding_dim
@@ -76,11 +78,18 @@ class AttentionModel(nn.Module):
         self.n_heads = n_heads # 多头注意力机制中的头数
         self.checkpoint_encoder = checkpoint_encoder
         self.shrink_size = shrink_size
+        self.use_time_state = use_time_state
+        self.time_state = time_state
+        self.mask_mode = 'soft' # CVRPTW的掩码模式：'soft'为公式(18)，'hard'为公式(19)；训练只用'soft'
+        assert time_state in ('paper', 'legacy')
+        assert use_time_state or time_state == 'paper'
 
 ###################################  问题的上下文参数  ###################################
         if self.is_vrp or self.is_cvrptw or self.is_orienteering or self.is_pctsp:
             # Embedding of last node + remaining_capacity / remaining length / remaining prize to collect
-            step_context_dim = embedding_dim + 3 # 上一个节点的嵌入向量 + 剩余容量 / 剩余长度 / 剩余奖励 + 到达节点的时间 + 车辆速度
+            step_context_dim = embedding_dim + 1 # 上一个节点的嵌入向量 + 剩余容量 / 剩余长度 / 剩余奖励
+            if self.is_cvrptw and self.use_time_state:
+                step_context_dim += 2 # 公式(14)：再拼接到达时刻T_a与车速S_v
 
             if self.is_pctsp:
                 node_dim = 4  # x, y, expected_prize, penalty
@@ -125,6 +134,18 @@ class AttentionModel(nn.Module):
         self.decode_type = decode_type
         if temp is not None:  # Do not change temperature if not provided
             self.temp = temp
+
+    def set_mask_mode(self, mask_mode):
+        assert mask_mode in ('soft', 'hard')
+        self.mask_mode = mask_mode
+
+    def encode(self, input):
+        """编码器：返回节点嵌入 (batch_size, graph_size+1, embedding_dim)"""
+        return self.embedder(self._init_embed(input))[0]
+
+    def decode(self, input, embeddings):
+        """解码器：按当前decode_type与mask_mode构造解，返回 (每步对数概率, 节点序列pi)"""
+        return self._inner(input, embeddings)
 
     def forward(self, input, return_pi=False):
         """
@@ -262,7 +283,10 @@ class AttentionModel(nn.Module):
         outputs = []
         sequences = []
 
-        state = self.problem.make_state(input) # 根据input（depot、loc、demand）生成问题状态
+        if self.is_cvrptw:
+            state = self.problem.make_state(input, hard=self.mask_mode == 'hard', legacy=self.time_state == 'legacy')
+        else:
+            state = self.problem.make_state(input) # 根据input（depot、loc、demand）生成问题状态
 
         # Compute keys, values for the glimpse and keys for the logits once as they can be reused in every step
         fixed = self._precompute(embeddings) # 计算embeddings的固定上下文，得到AttentionModelFixed对象，其中包含embeddings, fixed_context, multihead_glimpse_key, multihead_glimpse_val, logit_key
@@ -454,21 +478,23 @@ class AttentionModel(nn.Module):
                     -1
                 )
             else:
-                return torch.cat( # 当前节点的嵌入向量和剩余容量的拼接(batch_size, num_steps, embedding_dim+1)
-                    (
-                        torch.gather( # 通过当前节点的索引获取节点的嵌入向量
-                            embeddings, # (batch_size, graph_size=21, embedding_dim=128)
-                            1, #
-                            current_node.contiguous() # (1024, 1)
-                                .view(batch_size, num_steps, 1) # (1024, 1, 1)
-                                .expand(batch_size, num_steps, embeddings.size(-1)) # (1024, 1, 128) 将当前节点的索引扩展成与嵌入向量相同的维度
-                        ).view(batch_size, num_steps, embeddings.size(-1)), # (1024, 1, 128) 当前节点的嵌入向量
-                        self.problem.VEHICLE_CAPACITY - state.used_capacity[:, :, None], # (1024, 1, 1) 剩余容量
-                        state.cur_arrival_time[:, :, None], # (1024, 1, 1) 当前节点的到达时间
-                        state.vehicle_speed[:, :, None] # (1024, 1, 1) 车辆的速度
-                    ),
-                    -1
-                )
+                # 公式(14)：Concat(f_c, C_r, T_a, S_v)；w/o ET时只有Concat(f_c, C_r)
+                context = [
+                    torch.gather( # 通过当前节点的索引获取节点的嵌入向量
+                        embeddings, # (batch_size, graph_size=21, embedding_dim=128)
+                        1, #
+                        current_node.contiguous() # (1024, 1)
+                            .view(batch_size, num_steps, 1) # (1024, 1, 1)
+                            .expand(batch_size, num_steps, embeddings.size(-1)) # (1024, 1, 128) 将当前节点的索引扩展成与嵌入向量相同的维度
+                    ).view(batch_size, num_steps, embeddings.size(-1)), # (1024, 1, 128) 当前节点的嵌入向量
+                    self.problem.VEHICLE_CAPACITY - state.used_capacity[:, :, None] # (1024, 1, 1) 剩余容量
+                ]
+                if self.is_cvrptw and self.use_time_state:
+                    context += [
+                        state.cur_arrival_time[:, :, None], # (1024, 1, 1) 当前节点的到达时刻T_a（小时）
+                        state.vehicle_speed[:, :, None] # (1024, 1, 1) 车辆的速度S_v
+                    ]
+                return torch.cat(context, -1) # (batch_size, num_steps, step_context_dim)
         elif self.is_orienteering or self.is_pctsp:
             return torch.cat(
                 (

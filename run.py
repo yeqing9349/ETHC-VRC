@@ -2,19 +2,24 @@
 
 import os
 import json
+import time
 import pprint as pp
 
 import torch
 import torch.optim as optim
-from tensorboard_logger import Logger as TbLogger
 
 from nets.critic_network import CriticNetwork
+from nets.factory import make_model
 from options import get_options
-from train import train_epoch, validate, get_inner_model
+from train import train_epoch, validate, get_inner_model, probe_training
 from reinforce_baselines import NoBaseline, ExponentialBaseline, CriticBaseline, RolloutBaseline, WarmupBaseline
-from nets.attention_model import AttentionModel
-from nets.pointer_network import PointerNetwork, CriticNetworkLSTM
+from nets.pointer_network import CriticNetworkLSTM
 from utils import torch_load_cpu, load_problem
+from utils.log_utils import CsvLogger
+
+TRAIN_LOG_FIELDS = ('step', 'epoch', 'batch_id', 'cost', 'length', 'lateness', 'n_late', 'loss', 'grad_norm', 'aux_loss')
+VAL_LOG_FIELDS = ('epoch', 'step', 'val_cost', 'val_length', 'val_lateness', 'val_late_rate', 'epoch_time_s',
+                  'baseline_epoch', 'baseline_p', 'baseline_updated')
 
 
 def run(opts):
@@ -27,20 +32,30 @@ def run(opts):
 
     # Optionally configure tensorboard
     tb_logger = None
-    if not opts.no_tensorboard:
+    if opts.tensorboard:
+        from tensorboard_logger import Logger as TbLogger
         tb_logger = TbLogger(os.path.join(opts.log_dir, "{}_{}".format(opts.problem, opts.graph_size), opts.run_name))
 
-####################  创建输出目录'outputs/cvrp_20/cvrp_20_20191212T161616和保存运行参数的文件'args.json'  ####################
-    os.makedirs(opts.save_dir)
-    # Save arguments so exact configuration can always be found
-    with open(os.path.join(opts.save_dir, "args.json"), 'w') as f:
-        json.dump(vars(opts), f, indent=True)
-#########################################################################################################################
+####################  创建输出目录，续训时沿用已有目录  ####################
+    os.makedirs(opts.save_dir, exist_ok=True)
+    if opts.resume == 'auto':
+        last_path = os.path.join(opts.save_dir, 'last.pt')
+        opts.resume = last_path if os.path.isfile(last_path) else None
+    if opts.resume is None and opts.probe_steps == 0:
+        # Save arguments so exact configuration can always be found
+        with open(os.path.join(opts.save_dir, "args.json"), 'w') as f:
+            json.dump(vars(opts), f, indent=True)
+#########################################################################
     # Set the device
     opts.device = torch.device("cuda:0" if opts.use_cuda else "cpu")
+    if opts.tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
 #########################  加载问题  #########################
     problem = load_problem(opts.problem)
+    if problem.NAME == 'cvrptw':
+        problem.set_penalty_lambda(opts.penalty_lambda)  # β = λ·T_w
 #############################################################
 
 ####################  加载模型参数  ####################
@@ -53,23 +68,7 @@ def run(opts):
 ######################################################
 
 #####################################  初始化模型  #####################################
-    model_class = {
-        'attention': AttentionModel,
-        'pointer': PointerNetwork
-    }.get(opts.model, None)
-    assert model_class is not None, "Unknown model: {}".format(model_class)
-    model = model_class(
-        opts.embedding_dim, # 嵌入向量维度
-        opts.hidden_dim, # 隐藏层向量维度
-        problem, # 问题实例
-        n_encode_layers=opts.n_encode_layers, # 编码器中隐藏层的层数
-        mask_inner=True, # 是否在内部层中使用掩码
-        mask_logits=True, # 是否在计算logits时使用掩码
-        normalization=opts.normalization, # 归一化类型
-        tanh_clipping=opts.tanh_clipping, # 使用tanh裁剪参数的值
-        checkpoint_encoder=opts.checkpoint_encoder, # 是否检查点编码器
-        shrink_size=opts.shrink_size # 缩小大小以节省内存
-    ).to(opts.device)
+    model = make_model(opts, problem).to(opts.device)
     # 如果使用cuda并且有多个GPU，则使用DataParallel，在多个GPU上并行运行
     if opts.use_cuda and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
@@ -79,6 +78,9 @@ def run(opts):
     model_.load_state_dict({**model_.state_dict(), **load_data.get('model', {})})
 #########################################################################################
 
+    if opts.probe_steps > 0:
+        probe_training(model, problem, opts)
+        return
 
 ###########################################  初始化baseline  ###########################################
     if opts.baseline == 'exponential': # 指数类型基线
@@ -147,22 +149,31 @@ def run(opts):
         size=opts.graph_size, num_samples=opts.val_size, filename=opts.val_dataset,
         distribution=opts.data_distribution)
 
-    if opts.resume: # 如果是恢复训练，则从上次训练的epoch开始
-        epoch_resume = int(os.path.splitext(os.path.split(opts.resume)[-1])[0].split("-")[1])
+    if opts.resume: # 如果是恢复训练，则从上次训练的epoch之后开始
+        if 'epoch' in load_data:
+            # last.pt/epoch-n.pt 在验证与基线检验之后保存，直接从下一个epoch继续
+            epoch_resume = load_data['epoch']
+        else:
+            # 旧格式的检查点在基线检验之前保存，需补做一次检验
+            epoch_resume = int(os.path.splitext(os.path.split(opts.resume)[-1])[0].split("-")[1])
+            baseline.epoch_callback(model, epoch_resume)
 
         torch.set_rng_state(load_data['rng_state'])
         if opts.use_cuda:
             torch.cuda.set_rng_state_all(load_data['cuda_rng_state'])
-        # Set the random states
-        # Dumping of state was done before epoch callback, so do that now (model is loaded)
-        baseline.epoch_callback(model, epoch_resume)
         print("Resuming after {}".format(epoch_resume))
         opts.epoch_start = epoch_resume + 1
 
+    csv_loggers = {
+        'train': CsvLogger(os.path.join(opts.save_dir, 'train_log.csv'), TRAIN_LOG_FIELDS),
+        'val': CsvLogger(os.path.join(opts.save_dir, 'val_log.csv'), VAL_LOG_FIELDS)
+    }
+
     if opts.eval_only: # 如果只是评估模型，则只进行评估
         validate(model, val_dataset, opts)
-    else: # 否则进行训练
-        for epoch in range(opts.epoch_start, opts.epoch_start + opts.n_epochs):
+    else: # 否则进行训练，共 n_epochs 个 epoch（续训时只训练剩余的 epoch）
+        start_time = time.time()
+        for epoch in range(opts.epoch_start, opts.n_epochs):
             train_epoch(
                 model, # 模型
                 optimizer, # 优化器
@@ -172,8 +183,13 @@ def run(opts):
                 val_dataset, # 验证集
                 problem, # 问题实例
                 tb_logger, # tensorboard日志
-                opts # 运行参数
+                opts, # 运行参数
+                csv_loggers # CSV日志：训练曲线与验证记录
             )
+        # 训练完成的标记，编排脚本据此跳过已完成的任务
+        with open(os.path.join(opts.save_dir, 'done.json'), 'w') as f:
+            json.dump({'final_epoch': opts.n_epochs - 1, 'resumed_from': opts.epoch_start,
+                       'session_time_s': time.time() - start_time}, f, indent=1)
 #########################################################################################################################
 
 if __name__ == "__main__":

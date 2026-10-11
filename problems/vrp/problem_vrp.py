@@ -15,23 +15,37 @@ class CVRPTW(object):
 
     VEHICLE_CAPACITY = 1.0  # 车辆容量为1，demands需要被缩放
 
-    WORK_TIME = 8.0  # 一天工作8小时
+    WORK_TIME = 8.0  # 一天工作8小时（T_w）
     TIME_WINDOW_LENGTH = 2  # 时间窗的长度为2小时，即一天被分为4个时间窗分别是9:00-11:00, 11:00-13:00, 13:00-15:00, 15:00-17:00，客户的时间窗是从这4个时间窗中选择的
 
-    VEHICLE_SPEED = 2  # speed of the vehicle 领域边长为1.0，设置车辆速度为1小时1个边长
-    PENALTY = WORK_TIME * 2  # 以小时为单位违反时间窗的惩罚系数
+    VEHICLE_SPEED = 2  # speed of the vehicle 领域边长为1.0，车辆每小时行驶2个坐标单位（S_v）
+    PENALTY_LAMBDA = 3.0  # 惩罚缩放因子λ，公式(10)：β = λ·T_w，默认λ=3即β=24（每小时迟到）
+    LATE_EPS = 1e-6  # 迟到超过该值（小时）才计为迟到客户，避免浮点舍入把准时到达记为迟到
+
+    @staticmethod
+    def penalty():
+        """惩罚系数β = λ·T_w（每小时迟到）"""
+        return CVRPTW.PENALTY_LAMBDA * CVRPTW.WORK_TIME
+
+    @staticmethod
+    def set_penalty_lambda(penalty_lambda):
+        CVRPTW.PENALTY_LAMBDA = float(penalty_lambda)
 
     @staticmethod
     def get_costs(dataset, pi):
         """
+        混合成本，公式(1)：J(Y) = Σ_j [l(Y_j) + β·t_vio(Y_j)]
         :param dataset: 字典，包含了问题的所有数据（depot、loc、demand、time windows）
-        :param pi: 张量(batch_size, steps)，表示一种可能的路径，即节点的访问顺序
-        :return cost: cost = distance + 系数*违背时间窗的客户数量
-        :return Mask: None
+        :param pi: 张量(batch_size, steps)，表示一种可能的路径，即节点的访问顺序，0表示回到仓库
+        :return cost: (batch_size,) 混合成本 = 路径总长度 + β·总迟到时长（小时）
+        :return mask: None
+        :return lateness: (batch_size,) 总迟到时长（小时）
+        :return n_late: (batch_size,) 迟到的客户数量
+        :return route_length: (batch_size,) 路径总长度
         """
         batch_size, graph_size = dataset['demand'].size()
         # Check that tours are valid, i.e. contain 0 to n -1
-        sorted_pi = pi.data.sort(1)[0] # 一个batch中的路径都是一样的，所以只需要检查一个路径即可
+        sorted_pi = pi.data.sort(1)[0]
 
         """
         验证路径是否合法，即路径中包含节点1到n
@@ -41,101 +55,85 @@ class CVRPTW(object):
             sorted_pi[:, -graph_size:]
         ).all() and (sorted_pi[:, :-graph_size] == 0).all(), "Invalid tour"
 
-
         """
         将仓库的demand设置为-VEHICLE_CAPACITY，与其他客户的demand拼接，得到[batch_size, graph_size+1]
-        然后按照路径pi，将demand取出，得到[batch_size, steps]
+        然后按照路径pi，将demand取出，得到[batch_size, steps]，逐步累计已用容量，验证是否超过容量
         """
         demand_with_depot = torch.cat(
             (
-                torch.full_like(dataset['demand'][:, :1], -CVRP.VEHICLE_CAPACITY),
+                torch.full_like(dataset['demand'][:, :1], -CVRPTW.VEHICLE_CAPACITY),
                 dataset['demand']
             ),
             1
         )
-        d = demand_with_depot.gather(1, pi) # 按照路径pi，将demand_with_depot中的demand取出，得到[batch_size, steps]
-
-
-        """
-        遍历路径pi中的每个节点，计算used_cap，验证是否超过容量
-        """
-        used_cap = torch.zeros_like(dataset['demand'][:, 0]) # 初始化已用容量为0 [batch_size]
-        # 遍历路径中的每个节点，计算used_cap，验证是否超过容量
+        d = demand_with_depot.gather(1, pi)
+        used_cap = torch.zeros_like(dataset['demand'][:, 0])
+        exceeded = torch.zeros_like(used_cap, dtype=torch.bool)
         for i in range(pi.size(1)):
-            used_cap += d[:, i]  # This will reset/make capacity negative if i == 0, e.g. depot visited
-            # Cannot use less than 0
-            used_cap[used_cap < 0] = 0
-            assert (used_cap <= CVRP.VEHICLE_CAPACITY + 1e-5).all(), "Used more than capacity"
-
+            used_cap = torch.clamp(used_cap + d[:, i], min=0)  # This will reset capacity if the depot is visited
+            exceeded = exceeded | (used_cap > CVRPTW.VEHICLE_CAPACITY + 1e-5)
+        assert not exceeded.any(), "Used more than capacity"
 
         """
         拼接仓库坐标和节点坐标，得到[batch_size, graph_size+1, 2]
         按照路径pi，将坐标取出，得到[batch_size, steps, 2]
         计算路径pi的欧几里得距离，加上从仓库出发到第一个节点，加上从最后一个节点到仓库
         """
-        loc_with_depot = torch.cat((dataset['depot'][:, None, :], dataset['loc']), 1) # 仓库坐标和节点坐标拼接，得到[batch_size, graph_size+1, 2]
-        pi_coords = loc_with_depot.gather(1, pi[..., None].expand(*pi.size(), loc_with_depot.size(-1))) # 按照路径pi，将loc_with_depot中的坐标取出，得到[batch_size, steps, 2]
+        loc_with_depot = torch.cat((dataset['depot'][:, None, :], dataset['loc']), 1)
+        pi_coords = loc_with_depot.gather(1, pi[..., None].expand(*pi.size(), loc_with_depot.size(-1)))
 
         first_to_last = (pi_coords[:, 1:] - pi_coords[:, :-1]).norm(p=2, dim=2).sum(1) # [batch_size] 每个节点到下一个节点的距离之和
         depot_to_first = (pi_coords[:, 0] - dataset['depot']).norm(p=2, dim=1) # [batch_size] 第一个节点到仓库
         last_to_depot = (pi_coords[:, -1] - dataset['depot']).norm(p=2, dim=1) # [batch_size] 最后一个节点到仓库
         route_length = first_to_last + depot_to_first + last_to_depot # [batch_size] 总路径长度
 
-        violated_time_num, violated_node_num, arrival_time = CVRPTW.calculate_time_windows_violations(dataset, pi)
+        lateness, n_late = CVRPTW.calculate_time_windows_violations(dataset, pi)
 
-        cost = route_length + CVRPTW.PENALTY * violated_time_num.squeeze()
+        cost = route_length + CVRPTW.penalty() * lateness
 
-        return cost, None, violated_time_num.squeeze(), violated_node_num.squeeze(), route_length
+        return cost, None, lateness, n_late, route_length
 
     @staticmethod
     def calculate_time_windows_violations(dataset, pi):
         """
-        计算违反时间窗的客户数量，以及车辆到达最后一个节点的时间
+        按算法1的时间模型计算每个实例的总迟到时长与迟到客户数：
+        每条路径由一辆车从仓库于时刻0出发；到达客户 T_a' = max(T_a + D/S_v, x^s)（早到等待）；迟到量 max(0, T_a' - x^t)；
+        回到仓库时开始下一条路径，时间清零。时间以小时计，运算顺序与StateCVRPTW.update一致。
         :param dataset: 字典，包含了问题的所有数据（depot、loc、demand、tw）
         :param pi: 张量(batch_size, steps)，表示一种可能的路径，即节点的访问顺序
-        :return violated_tw_time_num: 违反时间窗的时间
-        :return violated_tw_node_num: 违反时间窗的客户数量
-        :return arrival_time: 车辆到达最后一个节点的时间
+        :return lateness: (batch_size,) 总迟到时长（小时）
+        :return n_late: (batch_size,) 迟到的客户数量
         """
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        loc_with_depot = torch.cat((dataset['depot'][:, None, :], dataset['loc']), 1)  # [batch_size, graph_size+1, 2]
+        pi_coords = loc_with_depot.gather(1, pi[..., None].expand(*pi.size(), loc_with_depot.size(-1)))  # [batch_size, steps, 2]
+        tw_with_depot = torch.cat((torch.zeros_like(dataset['tw'][:, :1, :]), dataset['tw']), 1) * CVRPTW.WORK_TIME  # 仓库一行不参与计算
+        pi_tw = tw_with_depot.gather(1, pi[..., None].expand(*pi.size(), 2))  # [batch_size, steps, 2] 时间窗（小时）
 
-        depot_tw = (torch.full((dataset['tw'].size(0), 1, 2), fill_value=0)/CVRPTW.WORK_TIME).to(device)  # 仓库的时间窗为[0, 0]/CVRTPTW.WORK_TIME
-        depot_tw[:, :, 1] = 8/CVRPTW.WORK_TIME  # 仓库的时间窗为[0, 8]/CVRPTW.WORK_TIME
+        prev_coord = dataset['depot']
+        clock = torch.zeros_like(pi_coords[:, 0, 0])
+        lateness = torch.zeros_like(clock)
+        n_late = torch.zeros_like(clock)
+        for i in range(pi.size(1)):
+            cur_coord = pi_coords[:, i]
+            arrival = clock + (cur_coord - prev_coord).norm(p=2, dim=-1) / CVRPTW.VEHICLE_SPEED
+            is_depot = pi[:, i] == 0
+            clock = torch.where(is_depot, torch.zeros_like(arrival), torch.max(arrival, pi_tw[:, i, 0]))
+            late = torch.where(is_depot, torch.zeros_like(clock), torch.clamp(clock - pi_tw[:, i, 1], min=0))
+            lateness = lateness + late
+            n_late = n_late + (late > CVRPTW.LATE_EPS).float()
+            prev_coord = cur_coord
 
-        depot_loc_tw = torch.cat((depot_tw, dataset['tw']), 1)  # 拼接仓库时间窗和节点时间窗 [batch_size, graph_size+1, 2]
+        return lateness, n_late
 
-        depot_pi = torch.cat((torch.zeros_like(pi[:, :1]), pi), 1)  # 在路径pi的前面添加仓库节点 [batch_size, steps+1]
-        depot_pi_tw = depot_loc_tw.gather(1, depot_pi[..., None].expand(*depot_pi.size(), depot_loc_tw.size(-1)))  # 按照路径depot_pi，将时间窗信息取出 [batch_size, steps+1, 2]
-
-        loc_with_depot = torch.cat((dataset['depot'][:, None, :], dataset['loc']), 1)  # 拼接仓库坐标和节点坐标 [batch_size, graph_size+1, 2]
-        depot_pi_coords = loc_with_depot.gather(1, depot_pi[..., None].expand(*depot_pi.size(), loc_with_depot.size(-1)))  # 按照路径depot_pi，将坐标取出 [batch_size, steps+1, 2]
-
-        batch_size, steps = depot_pi.shape
-        violated_tw_node_num = torch.zeros(batch_size, 1).to(device)  # 初始化违反节点时间窗violated_node_num [batch_size, 1]
-        violated_tw_time_num = torch.zeros(batch_size, 1).to(device)  # 初始化违反节点时间窗violated_node_num [batch_size, 1]
-        arrival_time = torch.zeros(batch_size, 1).to(device)  # 初始化车辆到达节点的时间arrival_time [batch_size, 1]
-
-        # 遍历depot_pi [batch_size, steps+2]
-        for i in range(steps - 1):
-            distance = (depot_pi_coords[:, i + 1] - depot_pi_coords[:, i]).norm(p=2, dim=1)[:, None]  # 计算节点之间的欧几里得距离
-
-            current_step_node = depot_pi[:, i + 1].unsqueeze(1)  # 获取当前step所在的节点 [batch_size, 1]
-
-            arrival_time += distance / CVRPTW.VEHICLE_SPEED / CVRPTW.WORK_TIME  # 计算到达下一个节点（i+1）的时间
-            arrival_time = torch.where(current_step_node == 0, torch.zeros_like(arrival_time),
-                                       arrival_time)  # 如果当前节点是depot，则将arrival_time置为0
-
-            selected_tw = torch.gather(depot_loc_tw, 1, current_step_node[:, :, None].expand(batch_size, 1, 2))  # 当前节点的时间窗 (batch_size, 1, 2)
-            """
-            如果到达当前节点的时间cur_arrival_time小于时间窗的左边界，则需要等待到时间窗的左边界，即cur_arrival_time = 时间窗的左边界；
-            如果cur_arrival_time大于时间窗的右边界，则违反时间窗。
-            """
-            arrival_time = torch.where(arrival_time < selected_tw[:, :, 0], selected_tw[:, :, 0], arrival_time)
-            violated_tw_node_num = torch.where(arrival_time > selected_tw[:, :, 1], violated_tw_node_num + 1, violated_tw_node_num)  # 如果到达节点的时间超过该节点的右时间窗，violated_tw_node_num+1
-            violated_tw_time_num = torch.where(arrival_time > selected_tw[:, :, 1], violated_tw_time_num + arrival_time - selected_tw[:, :, 1], violated_tw_time_num)  # 如果到达节点的时间超过该节点的右时间窗，violated_tw_time_num+超出时间
-
-        return violated_tw_time_num * CVRPTW.WORK_TIME, violated_tw_node_num, arrival_time * CVRPTW.WORK_TIME
-
+    @staticmethod
+    def count_vehicles(pi):
+        """
+        车辆数 = 路径条数，即序列中每一段以客户开头的连续客户串（仓库0为分隔符）
+        :param pi: (batch_size, steps)
+        :return: (batch_size,)
+        """
+        starts = (pi[:, 1:] != 0) & (pi[:, :-1] == 0)
+        return (pi[:, 0] != 0).long() + starts.long().sum(1)
 
     @staticmethod
     def make_dataset(*args, **kwargs):
@@ -333,60 +331,66 @@ def make_instance_cvrptw(args):
         'tw': torch.tensor(tw, dtype=torch.float) / worktime
     }
 
+CVRPTW_CAPACITIES = {
+    10: 20.,
+    20: 30.,
+    30: 35.,
+    50: 40.,
+    70: 45.,
+    100: 50.
+}
+
+
 class CVRPTWDataset(Dataset):
-    
+    """
+    实例以堆叠张量保存：depot (N, 2)，loc (N, n, 2)，demand (N, n)（按容量归一），tw (N, n, 2)（按T_w归一）。
+    下标可以是整数，也可以是一批下标（list/张量），后者直接返回整批数据，配合BatchSampler使用可省去逐条拼接。
+    """
+
     def __init__(self, filename=None, size=50, num_samples=1000000, offset=0, distribution=None):
         super().__init__()
 
-        self.data_set = []
         if filename is not None:
             assert os.path.splitext(filename)[1] == '.pkl'
 
             with open(filename, 'rb') as f:
                 data = pickle.load(f)
-            self.data = [make_instance_cvrptw(args) for args in data[offset:offset+num_samples]]
+            data = data[offset:offset+num_samples]
+            depot, loc, demand, capacity, tw, worktime = (np.array(x, dtype=np.float32) for x in zip(*data))
+            self.data = {
+                'depot': torch.from_numpy(depot),
+                'loc': torch.from_numpy(loc),
+                'demand': torch.from_numpy(demand / capacity[:, None]),
+                'tw': torch.from_numpy(tw / worktime[:, None, None])
+            }
 
         else:
 
-            # From VRP with RL paper https://arxiv.org/abs/1802.04240
-            CAPACITIES = {
-                10: 20.,
-                20: 30.,
-                30: 35.,
-                50: 40.,
-                70: 45.,
-                100: 50.
-            }
-
             """
-            生成时间窗数据，形状为[batch_size, 2]，左时间窗从[0,2,4,6]中随机选择，右时间窗为左时间窗+2
+            生成时间窗数据：左时间窗从[0,2,4,6]中随机选择，右时间窗为左时间窗+2（小时），再按T_w归一
+            需求为1–9的均匀整数，按容量归一；坐标为[0,1]²上的均匀分布（PyTorch随机数）
             """
-            # time_windows_left_options = np.arange(0, CVRPTW.WORK_TIME, CVRPTW.TIME_WINDOW_LENGTH) # [0, 2, 4, 6]
-            # time_windows_right_options = time_windows_left_options + CVRPTW.TIME_WINDOW_LENGTH # [2, 4, 6, 8]
-            # time_windows = np.stack((time_windows_left_options, time_windows_right_options), axis=-1) # [[0, 2], [2, 4], [4, 6], [6, 8]]
             time_windows_left_options = torch.arange(0, CVRPTW.WORK_TIME, CVRPTW.TIME_WINDOW_LENGTH)  # [0, 2, 4, 6]
             time_windows_right_options = time_windows_left_options + CVRPTW.TIME_WINDOW_LENGTH  # [2, 4, 6, 8]
             time_windows = torch.stack((time_windows_left_options, time_windows_right_options), dim=-1)  # [[0, 2], [2, 4], [4, 6], [6, 8]]
 
-            self.data = [
-                {
-                    'loc': torch.FloatTensor(size, 2).uniform_(0, 1),
-                    'depot': torch.FloatTensor(2).uniform_(0, 1),
-                    # Uniform 1 - 9, scaled by capacities
-                    'demand': (torch.FloatTensor(size).uniform_(0, 9).int() + 1).float() / CAPACITIES[size],
-                    'tw': torch.gather(time_windows, 0, torch.IntTensor(size, 1).random_(0, time_windows.shape[0]).repeat(1, 2).long()) / CVRPTW.WORK_TIME
-                    # 'tw': torch.from_numpy(time_windows[np.random.choice(time_windows.shape[0], size), :]).float() / CVRPTW.WORK_TIME # 随机选择一个时间窗
-                }
-                for i in range(num_samples)
-            ]
+            self.data = {
+                'loc': torch.FloatTensor(num_samples, size, 2).uniform_(0, 1),
+                'depot': torch.FloatTensor(num_samples, 2).uniform_(0, 1),
+                # Uniform 1 - 9, scaled by capacities
+                'demand': (torch.FloatTensor(num_samples, size).uniform_(0, 9).int() + 1).float() / CVRPTW_CAPACITIES[size],
+                'tw': time_windows[torch.randint(0, time_windows.shape[0], (num_samples, size))] / CVRPTW.WORK_TIME
+            }
 
-        self.size = len(self.data)
+        self.size = self.data['loc'].size(0)
 
     def __len__(self):
         return self.size
 
     def __getitem__(self, idx):
-        return self.data[idx]
+        if not isinstance(idx, int):
+            idx = torch.as_tensor(idx, dtype=torch.long)
+        return {k: v[idx] for k, v in self.data.items()}
 
 
 class VRPDataset(Dataset):

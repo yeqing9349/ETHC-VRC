@@ -1,5 +1,7 @@
 import argparse
+import json
 import os
+import pickle
 import numpy as np
 from utils.data_utils import check_extension, save_dataset
 from problems.vrp.problem_vrp import CVRPTW
@@ -123,7 +125,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--filename", help="Filename of the dataset to create (ignores datadir)")
     parser.add_argument("--data_dir", default='data', help="Create datasets in data_dir/problem (default 'data')")
-    parser.add_argument("--name", type=str, required=True, help="Name to identify dataset")
+    parser.add_argument("--name", type=str, help="Name to identify dataset")
     parser.add_argument("--problem", type=str, default='all',
                         help="Problem, 'tsp', 'vrp', 'pctsp' or 'op_const', 'op_unif' or 'op_dist', 'cvrptw'"
                              " or 'all' to generate all")
@@ -135,10 +137,34 @@ if __name__ == "__main__":
                         help="Sizes of problem instances (default 20, 50, 100)")
     parser.add_argument("-f", action='store_true', help="Set true to overwrite")
     parser.add_argument('--seed', type=int, default=1234, help="Random seed")
+    parser.add_argument('--check', default=None,
+                        help="CVRPTW only: regenerate the test (seed 1234) and validation (seed 4321) sets in memory, "
+                             "compare them with the files in data_dir and write the result to this JSON file")
 
     opts = parser.parse_args()
 
-    assert opts.filename is None or (len(opts.problems) == 1 and len(opts.graph_sizes) == 1), \
+    if opts.check is not None:
+        # 数据检查：重新生成测试集与验证集并与仓库内的 pkl 逐值比较；只作记录，正式实验始终使用仓库内的 pkl
+        report = {}
+        for name, seed in (('test', 1234), ('validation', 4321)):
+            for graph_size in opts.graph_sizes:
+                filename = os.path.join(opts.data_dir, 'cvrptw', 'cvrptw{}_{}_seed{}.pkl'.format(graph_size, name, seed))
+                np.random.seed(seed)
+                regenerated = generate_cvrptw_data(opts.dataset_size, graph_size)
+                with open(filename, 'rb') as f:
+                    stored = pickle.load(f)
+                identical = len(stored) == len(regenerated) and all(
+                    np.array_equal(np.array(a, dtype=float), np.array(b, dtype=float))
+                    for x, y in zip(stored, regenerated) for a, b in zip(x, y))
+                report[os.path.basename(filename)] = {'instances': len(stored), 'regenerated_identical': bool(identical)}
+                print(filename, 'identical' if identical else 'DIFFERENT (the stored file is used)')
+        os.makedirs(os.path.dirname(os.path.abspath(opts.check)), exist_ok=True)
+        with open(opts.check, 'w') as f:
+            json.dump(report, f, indent=1)
+        raise SystemExit(0)
+
+    assert opts.name is not None, "--name is required"
+    assert opts.filename is None or (opts.problem != 'all' and len(opts.graph_sizes) == 1), \
         "Can only specify filename when generating a single dataset"
 
     distributions_per_problem = {
