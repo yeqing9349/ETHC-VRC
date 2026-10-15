@@ -15,7 +15,8 @@ from train import train_epoch, validate, get_inner_model, probe_training
 from reinforce_baselines import NoBaseline, ExponentialBaseline, CriticBaseline, RolloutBaseline, WarmupBaseline
 from nets.pointer_network import CriticNetworkLSTM
 from utils import torch_load_cpu, load_problem
-from utils.log_utils import CsvLogger
+from utils.log_utils import CsvLogger, truncate_csv_log
+from atomic_io import save_json
 
 TRAIN_LOG_FIELDS = ('step', 'epoch', 'batch_id', 'cost', 'length', 'lateness', 'n_late', 'loss', 'grad_norm', 'aux_loss')
 VAL_LOG_FIELDS = ('epoch', 'step', 'val_cost', 'val_length', 'val_lateness', 'val_late_rate', 'epoch_time_s',
@@ -43,8 +44,7 @@ def run(opts):
         opts.resume = last_path if os.path.isfile(last_path) else None
     if opts.resume is None and opts.probe_steps == 0:
         # Save arguments so exact configuration can always be found
-        with open(os.path.join(opts.save_dir, "args.json"), 'w') as f:
-            json.dump(vars(opts), f, indent=True)
+        save_json(vars(opts), os.path.join(opts.save_dir, "args.json"), indent=True)
 #########################################################################
     # Set the device
     opts.device = torch.device("cuda:0" if opts.use_cuda else "cpu")
@@ -168,6 +168,13 @@ def run(opts):
             epoch_resume, ', warmup alpha = {}'.format(baseline.alpha) if isinstance(baseline, WarmupBaseline) else ''))
         opts.epoch_start = epoch_resume + 1
 
+    if not opts.eval_only:
+        # 续训：删去检查点之后已写入的日志行（中断的那个 epoch 会重新训练、重新记录）；从头训练：清空旧日志
+        for name in ('train_log.csv', 'val_log.csv'):
+            dropped = truncate_csv_log(os.path.join(opts.save_dir, name), opts.epoch_start - 1)
+            if dropped:
+                print('Removed {} rows logged after epoch {} from {}'.format(dropped, opts.epoch_start - 1, name))
+
     csv_loggers = {
         'train': CsvLogger(os.path.join(opts.save_dir, 'train_log.csv'), TRAIN_LOG_FIELDS),
         'val': CsvLogger(os.path.join(opts.save_dir, 'val_log.csv'), VAL_LOG_FIELDS)
@@ -191,9 +198,8 @@ def run(opts):
                 csv_loggers # CSV日志：训练曲线与验证记录
             )
         # 训练完成的标记，编排脚本据此跳过已完成的任务
-        with open(os.path.join(opts.save_dir, 'done.json'), 'w') as f:
-            json.dump({'final_epoch': opts.n_epochs - 1, 'resumed_from': opts.epoch_start,
-                       'session_time_s': time.time() - start_time}, f, indent=1)
+        save_json({'final_epoch': opts.n_epochs - 1, 'resumed_from': opts.epoch_start,
+                   'session_time_s': time.time() - start_time}, os.path.join(opts.save_dir, 'done.json'), indent=1)
 #########################################################################################################################
 
 if __name__ == "__main__":

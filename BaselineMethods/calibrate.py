@@ -13,6 +13,7 @@ import time
 
 import numpy as np
 
+from atomic_io import save_json
 from BaselineMethods import solve as solve_mod
 
 
@@ -47,9 +48,10 @@ def run(opts):
         }
         print('n={}: costs {} -> converged at {}s, time limit {}s'.format(
             size, ['{:.4f}'.format(c) for c in costs], chosen, chosen * opts.margin))
+    from experiments import cpu_model
     result['created'] = time.strftime('%Y-%m-%d %H:%M:%S')
-    with open(opts.out, 'w', encoding='utf-8') as f:
-        json.dump(result, f, indent=1)
+    result['cpu_model'] = cpu_model()  # 时限只对这种 CPU 有效（configs/autodl.yaml 的 hardware.solver_cpu）
+    save_json(result, opts.out, indent=1)
     return result
 
 

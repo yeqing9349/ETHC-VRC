@@ -17,7 +17,8 @@ import os
 import sys
 from collections import defaultdict
 
-from experiments import load_config, build_tasks, eval_out, time_limit, auto_workers, threads_per_core, MAIN_LAMBDA
+from experiments import (load_config, build_tasks, eval_out, time_limit, auto_workers, threads_per_core, MAIN_LAMBDA,
+                         parse_tasks_per_gpu, tasks_per_gpu_for, max_tasks_per_gpu, gpu_task_size)
 
 VARIANT_NAMES = {'ethc': 'ETHC-VRC', 'ethc_woet': 'ETHC-VRC w/o ET', 'tpa': 'TPA-Reward', 'mvmoe': 'MVMoE',
                  'ortools': 'OR-Tools', 'ortools_eq': 'OR-Tools（等时）', 'ts': 'TS', 'ba': 'BA'}
@@ -142,25 +143,30 @@ def gain_at(gain, size):
     return gain[xs[-1]]
 
 
-def wall_clock(per_task, gpus, workers, per_gpu=1, gain=None):
-    """按 run_all.py 的调度估算墙钟小时数：非独占的 GPU 任务按最长优先分到 gpus × per_gpu 个槽位（每张卡同时运行 per_gpu 个
-    任务时，单个任务的耗时变为 per_gpu / 吞吐倍数 倍）；元启发式任务依次运行（每个任务 workers 个进程），与 GPU 任务同时进行；
-    独占的计时评估在其他任务结束后单独运行，等时比较在它之后。"""
-    durations = []
+def wall_clock(per_task, gpus, workers, policy=None, gain=None):
+    """按 run_all.py 的调度估算墙钟小时数。policy 为每卡同时运行的任务数（parse_tasks_per_gpu 的结果，可按规模）：
+    每卡同时运行 K 个规模为 s 的任务时，吞吐为单个任务的 gain(s) 倍，每个任务占用 GPU·h / gain(s) 卡·时，自身耗时
+    GPU·h × K / gain(s)；非独占的 GPU 任务按占用的卡·时最长优先分到各卡。元启发式任务依次运行（每个任务 workers 个进程），
+    与 GPU 任务同时进行；独占的计时评估在其他任务结束后单独运行，等时比较在它之后。"""
+    policy = policy or {None: 1}
+    card_hours, longest = [], 0.0
     for t, g, c in per_task:
         if g > 0 and not t.exclusive:
-            size = t.meta['size'] if t.stage == 'train' else t.meta.get('test_size', t.meta.get('size'))
-            durations.append(g * per_gpu / gain_at(gain, size) if per_gpu > 1 else g)
-    loads = [0.0] * (gpus * per_gpu)
-    for h in sorted(durations, reverse=True):
+            size = gpu_task_size(t)
+            k = tasks_per_gpu_for(policy, size)
+            speedup = gain_at(gain, size) if k > 1 else 1.0
+            card_hours.append(g / speedup)
+            longest = max(longest, g * k / speedup)
+    loads = [0.0] * gpus
+    for h in sorted(card_hours, reverse=True):
         i = loads.index(min(loads))
         loads[i] += h
-    gpu = max(loads)
+    gpu = max(max(loads), longest)
     cpu = sum(c for t, g, c in per_task if t.stage == 'solve') / workers
     timing = sum(g for t, g, c in per_task if t.exclusive)
     equal = sum(c for t, g, c in per_task if t.stage == 'equal_time') / workers
     return {'gpu': gpu, 'cpu': cpu, 'timing': timing, 'equal_time': equal,
-            'longest_task': max(durations, default=0.0), 'total': max(gpu, cpu) + timing + equal}
+            'longest_task': longest, 'total': max(gpu, cpu) + timing + equal}
 
 
 def main():
@@ -175,21 +181,23 @@ def main():
                              'are then computed as with workers: auto (physical cores minus one per GPU task, minus one). '
                              'Default: the workers of the paper config')
     parser.add_argument('--price', type=float, default=None, help='Rental price per GPU-hour (yuan), for a cost estimate')
-    parser.add_argument('--tasks-per-gpu', type=int, default=1, help='GPU tasks run concurrently on each GPU (run_all.py option)')
+    parser.add_argument('--tasks-per-gpu', default='1',
+                        help='GPU tasks run concurrently on each GPU, as in run_all.py: one number, or per size, '
+                             'e.g. 20:3,50:3,100:2')
     parser.add_argument('--gain', default=None,
-                        help='Measured throughput of --tasks-per-gpu concurrent tasks relative to one task, per size, '
-                             'e.g. 20:2.0,50:1.6,100:1.3 (interpolated between sizes)')
+                        help='Measured throughput when --tasks-per-gpu tasks of a size share a GPU, relative to one task, '
+                             'per size, e.g. 20:2.15,50:1.91,100:1.37 (interpolated between sizes)')
     opts = parser.parse_args()
     paper, smoke = load_config(opts.paper), load_config(opts.smoke)
     gpu_counts = [int(g) for g in opts.gpus.split(',') if g]
-    per_gpu = opts.tasks_per_gpu
+    policy = parse_tasks_per_gpu(opts.tasks_per_gpu)
     gain = {int(k): float(v) for k, v in (kv.split(':') for kv in opts.gain.split(','))} if opts.gain else None
     out_dir = smoke.paths.results
 
     def workers_for(n_gpus):
         if opts.cpus_per_gpu is None:
             return paper.solvers.workers
-        return auto_workers(opts.cpus_per_gpu * n_gpus, n_gpus * per_gpu, threads_per_core())
+        return auto_workers(opts.cpus_per_gpu * n_gpus, n_gpus * max_tasks_per_gpu(policy), threads_per_core())
 
     lines = ['# 正式运行时长估算', '',
              '依据冒烟阶段测得的计时（GPU：{}；元启发式时限：{}）。GPU·h 为单卡串行时长；CPU·h 为单核时长。'.format(
@@ -211,17 +219,17 @@ def main():
         if missing:
             lines += ['缺少的计时（未计入）：' + '；'.join(sorted(missing)), '']
 
-    concurrency = '' if per_gpu == 1 else '每张卡同时运行 {} 个 GPU 任务（吞吐倍数 {}），'.format(
-        per_gpu, opts.gain or '未给出，按 1 计')
+    concurrency = '' if policy == {None: 1} else '每张卡同时运行的 GPU 任务数 {}（吞吐倍数 {}），'.format(
+        opts.tasks_per_gpu, opts.gain or '未给出，按 1 计')
     lines += ['## 墙钟时间与费用（训练用 FP32）', '',
               '{}GPU 任务按最长优先分到各卡；元启发式与 GPU 任务同时运行；计时评估（表2 的时间列）在其他任务结束后独占运行，'
               '等时比较在它之后。最长的单个训练任务约 {:.0f} 小时，卡再多也不会更短。'.format(
-                  concurrency, wall_clock(per_task_fp32, 1, 1, per_gpu, gain)['longest_task']), '',
+                  concurrency, wall_clock(per_task_fp32, 1, 1, policy, gain)['longest_task']), '',
               '| 卡数 | 元启发式进程 | GPU 任务（小时） | 元启发式（小时） | 计时 + 等时（小时） | 总时长 | 费用 |',
               '|---|---|---|---|---|---|---|']
     for n in gpu_counts:
         w = workers_for(n)
-        wc = wall_clock(per_task_fp32, n, w, per_gpu, gain)
+        wc = wall_clock(per_task_fp32, n, w, policy, gain)
         cost = '{:.0f} 元'.format(wc['total'] * n * opts.price) if opts.price is not None else '—'
         lines.append('| {} | {} | {:.0f} | {:.0f} | {:.1f} | {:.0f} 小时（{:.1f} 天） | {} |'.format(
             n, w, wc['gpu'], wc['cpu'], wc['timing'] + wc['equal_time'], wc['total'], wc['total'] / 24, cost))

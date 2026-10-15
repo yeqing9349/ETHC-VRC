@@ -159,8 +159,8 @@ if __name__ == "__main__":
                 report[os.path.basename(filename)] = {'instances': len(stored), 'regenerated_identical': bool(identical)}
                 print(filename, 'identical' if identical else 'DIFFERENT (the stored file is used)')
         os.makedirs(os.path.dirname(os.path.abspath(opts.check)), exist_ok=True)
-        with open(opts.check, 'w') as f:
-            json.dump(report, f, indent=1)
+        from atomic_io import save_json
+        save_json(report, opts.check, indent=1)
         raise SystemExit(0)
 
     assert opts.name is not None, "--name is required"

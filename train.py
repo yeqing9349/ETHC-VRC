@@ -7,6 +7,7 @@ import math
 from torch.utils.data import DataLoader, BatchSampler, SequentialSampler
 from torch.nn import DataParallel
 
+from atomic_io import save_json, save_torch
 from nets.attention_model import set_decode_type
 from utils.log_utils import log_values
 from utils import move_to
@@ -85,7 +86,8 @@ def clip_grad_norms(param_groups, max_norm=math.inf):
 
 
 def save_checkpoint(path, model, optimizer, baseline, epoch):
-    torch.save(
+    # 原子写入：保存时断电或被杀，last.pt 仍是上一个 epoch 的完整检查点，续训不受影响
+    save_torch(
         {
             'model': get_inner_model(model).state_dict(),
             'optimizer': optimizer.state_dict(),
@@ -283,7 +285,6 @@ def probe_training(model, problem, opts, warmup_steps=5):
         'device': torch.cuda.get_device_name(opts.device) if opts.device.type == 'cuda' else 'cpu',
         'torch': torch.__version__
     }
-    with open(os.path.join(opts.save_dir, 'probe.json'), 'w') as f:
-        json.dump(result, f, indent=1)
+    save_json(result, os.path.join(opts.save_dir, 'probe.json'), indent=1)
     print(json.dumps(result, indent=1))
     return result

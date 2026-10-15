@@ -291,7 +291,11 @@ def figure4(res, out_dir):
 # ---------------------------------------------------------------- 图5与消融
 def _train_log(cfg, variant, size, seed):
     path = os.path.join(run_dir(cfg, variant, size, MAIN_LAMBDA, seed), 'train_log.csv')
-    return pd.read_csv(path) if os.path.isfile(path) else None
+    if not os.path.isfile(path):
+        return None
+    # 续训会删去中断后写入的行（run.py）；这里再按步数去重（保留重新训练写入的行），保证曲线按步数单调
+    log = pd.read_csv(path)
+    return log.drop_duplicates('step', keep='last').sort_values('step').reset_index(drop=True)
 
 
 def figure5_and_ablation(res, out_dir):
@@ -429,8 +433,8 @@ def main():
         numbers['environment'] = _json(environment)
     numbers['sources'] = sorted(res.sources)
     numbers['missing'] = sorted(res.missing)
-    with open(os.path.join(out_dir, 'paper_numbers.json'), 'w', encoding='utf-8') as f:
-        json.dump(numbers, f, indent=1, default=float)
+    from atomic_io import save_json
+    save_json(numbers, os.path.join(out_dir, 'paper_numbers.json'), indent=1, default=float)  # 最后写：汇总完成的标记
     print('Wrote {} (missing results: {})'.format(os.path.join(out_dir, 'paper_numbers.json'), len(res.missing)))
 
 

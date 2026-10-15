@@ -16,6 +16,7 @@ import time
 
 import numpy as np
 
+from atomic_io import save_json, savez_compressed
 from BaselineMethods.cvrptw_eval import load_instances, eval_solution, to_sequence, WORK_TIME, SPEED
 
 FIELDS = ('cost', 'length', 'lateness', 'n_late', 'vehicles')
@@ -96,8 +97,9 @@ def run(opts):
                 metrics[i], extra[i], iterations[i], inst_time[i] = m, ex, its, el
                 sequences[i, :len(seq)] = seq
             done = end
-            np.savez_compressed(partial_path, done=done, metrics=metrics, extra=extra, iterations=iterations,
-                                inst_time=inst_time, sequences=sequences, wall=wall)
+            # 原子写入：保存进度时断电或被杀，进度文件仍是上一次的完整版本，续跑不受影响
+            savez_compressed(partial_path, done=done, metrics=metrics, extra=extra, iterations=iterations,
+                             inst_time=inst_time, sequences=sequences, wall=wall)
             print('{} {}: {}/{} instances, mean cost {:.4f}, {:.0f}s'.format(
                 opts.method, os.path.basename(opts.out), done, n_inst, np.nanmean(metrics[:done, 0]), wall))
 
@@ -121,9 +123,8 @@ def run(opts):
     }
     arrays = {'best_{}'.format(f): metrics[:, j] for j, f in enumerate(FIELDS)}
     arrays.update({'extra_vehicles': extra, 'iterations': iterations, 'inst_time': inst_time, 'sequences': sequences})
-    np.savez_compressed(opts.out + '.npz', **arrays)
-    with open(opts.out + '.json', 'w', encoding='utf-8') as f:
-        json.dump(summary, f, indent=1, ensure_ascii=False)
+    savez_compressed(opts.out + '.npz', **arrays)
+    save_json(summary, opts.out + '.json', indent=1, ensure_ascii=False)  # 汇总最后写：run_all.py 以它判断任务完成
     os.remove(partial_path)
     print('{} on {}: cost {:.4f}, feasible {:.3f}, vehicles {:.2f}, wall {:.0f}s'.format(
         opts.method, os.path.basename(opts.dataset), summary['best']['cost'], summary['best']['feasibility_rate'],

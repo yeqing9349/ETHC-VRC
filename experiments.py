@@ -144,6 +144,76 @@ def gpu_count():
         return 0
 
 
+def gpu_names():
+    """各张卡的型号（按编号）；没有显卡或读不到时为空列表"""
+    import subprocess
+    try:
+        out = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'], capture_output=True,
+                             text=True, timeout=30).stdout
+        return [line.strip() for line in out.splitlines() if line.strip()]
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
+# ---------------------------------------------------------------- 每张卡同时运行的 GPU 任务数
+def parse_tasks_per_gpu(spec):
+    """run_all.py 的 --tasks-per-gpu：一个整数（所有任务每卡 K 个），或按规模给出，如 "20:3,50:3,100:2"
+    （规模 ≤ 20 的任务每卡 3 个，≤ 50 的 3 个，更大的 2 个）。返回 {规模上限: 任务数}，整数时为 {None: K}"""
+    spec = str(spec).strip()
+    if ':' not in spec:
+        policy = {None: int(spec)}
+    else:
+        policy = {}
+        for part in spec.split(','):
+            size, _, k = part.partition(':')
+            policy[int(size)] = int(k)
+    if not policy or min(policy.values()) < 1:
+        raise ValueError('--tasks-per-gpu needs positive task counts: {}'.format(spec))
+    return policy
+
+
+def tasks_per_gpu_for(policy, size):
+    """规模为 size 的 GPU 任务每卡可同时运行几个：取不小于 size 的最小规模键，超过所有键（或规模未知）时取最大键的值"""
+    if None in policy:
+        return policy[None]
+    keys = sorted(policy)
+    for s in keys:
+        if size is not None and size <= s:
+            return policy[s]
+    return policy[keys[-1]]
+
+
+def max_tasks_per_gpu(policy):
+    """每张卡最多同时运行的 GPU 任务数（workers: auto 按它给每个 GPU 任务预留一个物理核）"""
+    return max(policy.values())
+
+
+def gpu_task_size(task):
+    """决定 GPU 任务显存与计算量的规模：训练取训练规模；评估取训练规模与测试规模中较大的一个"""
+    sizes = [task.meta[k] for k in ('size', 'test_size') if task.meta.get(k) is not None]
+    return max(sizes) if sizes else None
+
+
+# ---------------------------------------------------------------- 硬件检查
+HARDWARE_STAGES = {'timing': 'timing_gpu', 'solve': 'solver_cpu', 'equal_time': 'solver_cpu', 'calibrate': 'solver_cpu'}
+
+
+def hardware_requirement(cfg, task):
+    """与计时或求解质量有关的任务只在配置 hardware 段给定的硬件上运行（论文 §5.1.3 只写一套硬件）：
+    表2的计时（timing）要求 timing_gpu；元启发式（solve、equal_time、calibrate）要求 solver_cpu——n=50/100 在时限内
+    还没收敛，结果取决于单核速度，时限也是在这种 CPU 上标定的。返回 (键名, 型号) 或 None"""
+    key = HARDWARE_STAGES.get(task.stage)
+    hw = cfg.get('hardware') or {}
+    if key and hw.get(key):
+        return key, str(hw[key])
+    return None
+
+
+def hardware_matches(model, names):
+    """型号（如 "RTX 5090"）出现在 names 的每一项中（不区分大小写）"""
+    return bool(names) and all(model.lower() in n.lower() for n in names)
+
+
 def load_config(path, gpu_slots=None):
     """gpu_slots：同时运行的 GPU 任务数（run_all.py 的 GPU 槽位数），默认每张卡一个"""
     cfg = _load_with_base(path)

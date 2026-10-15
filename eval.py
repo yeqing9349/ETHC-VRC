@@ -16,6 +16,7 @@ import time
 import numpy as np
 import torch
 
+from atomic_io import save_json, savez_compressed
 from utils import load_model, move_to
 from utils.functions import do_batch_rep
 
@@ -186,9 +187,9 @@ def run(opts):
     arrays.update({f'{mode}_tours': tours[mode] for mode in opts.modes})
     arrays['best_tours'] = best_tours
     arrays.update({f'{mode}_kept_costs': v for mode, v in kept.items()})
-    np.savez_compressed(opts.out + '.npz', **arrays)
-    with open(opts.out + '.json', 'w', encoding='utf-8') as f:
-        json.dump(summary, f, indent=1, ensure_ascii=False)
+    # 先写逐实例结果，再写汇总（run_all.py 以汇总文件判断任务完成）；都用原子写入，中途断电不会留下写坏的文件
+    savez_compressed(opts.out + '.npz', **arrays)
+    save_json(summary, opts.out + '.json', indent=1, ensure_ascii=False)
 
     print('{} {} {} n={}: cost {:.4f} | {} | time {:.2f}s'.format(
         os.path.basename(opts.model), opts.strategy, '+'.join(opts.modes), n, summary['best']['cost'],
