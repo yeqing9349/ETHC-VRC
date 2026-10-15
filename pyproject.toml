@@ -1,0 +1,36 @@
+[project]
+name = "ethc-vrc"
+version = "1.1.0"
+description = "ETHC-VRC: explicit time-state decoding with hybrid constraint handling for the CVRPTW (code accompanying the paper)"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "torch==2.11.0",  # 最新提供 CUDA 12.8 版本的 PyTorch：支持 RTX 5090（sm_120），也兼容 12.x 驱动
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pandas>=2.1",
+    "matplotlib>=3.8",
+    "omegaconf>=2.3",
+    "ortools>=9.10",
+    "numba>=0.60",
+    "tqdm>=4.66",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+# The repository is a collection of scripts run from its root, not an installable package.
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

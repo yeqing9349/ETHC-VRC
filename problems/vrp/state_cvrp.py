@@ -6,8 +6,8 @@ from utils.boolmask import mask_long2bool, mask_long_scatter
 class StateCVRPTW(NamedTuple):
     # Fixed input
     coords: torch.Tensor  # [batch_size, graph_size+1, 2] 仓库和顾客的坐标
-    demand: torch.Tensor # [batch_size, graph_size] 顾客的需求
-    tw: torch.Tensor # [batch_size, graph_size, 2] 顾客的时间窗
+    demand: torch.Tensor # [batch_size, graph_size] 顾客的需求（已按车辆容量C归一）
+    tw: torch.Tensor # [batch_size, graph_size, 2] 顾客的时间窗（已按工作时长T_w归一）
 
     # If this state contains multiple copies (i.e. beam search) for the same instance, then for memory efficiency
     # the coords and demands tensors are not kept multiple times, so we need to use the ids to index the correct rows.
@@ -20,12 +20,19 @@ class StateCVRPTW(NamedTuple):
     lengths: torch.Tensor # 记录路径长度
     cur_coord: torch.Tensor # 当前坐标
     i: torch.Tensor  # 记录步数
-    cur_arrival_time: torch.Tensor # 当前节点的到达时间
-    violated_tw_num: torch.Tensor # 违反时间窗的客户数量
-    vehicle_speed: torch.Tensor # 车辆的速度
+    cur_arrival_time: torch.Tensor # 解码上下文中的到达时刻T_a（小时，算法1）；legacy模式下为旧实现的取值
+    clock: torch.Tensor # 按算法1维护的到达时刻（小时），用于硬掩码和迟到统计
+    lateness: torch.Tensor # 累计迟到时长（小时）
+    n_late: torch.Tensor # 迟到的客户数量
+    vehicle_speed: torch.Tensor # 车辆的速度S_v（坐标单位/小时）
+
+    hard: bool = False # True时按公式(19)对时间窗做硬掩码，False时为软约束模式
+    legacy: bool = False # True时复刻旧版的到达时刻上下文，仅用于旧模型的回归检验
 
     VEHICLE_CAPACITY = 1.0  # 与problem_vrp中的VEHICLE_CAPACITY相同
-    VEHICLE_SPEED = 2  # 按一小时跑2个边长的速度，与problem_vrp中的VEHICLE_SPEED相同
+    VEHICLE_SPEED = 2.0  # 按一小时跑2个边长的速度，与problem_vrp中的VEHICLE_SPEED相同
+    WORK_TIME = 8.0  # 工作时长T_w（小时），时间窗按它归一，与problem_vrp中的WORK_TIME相同
+    LATE_EPS = 1e-6  # 与problem_vrp中的LATE_EPS相同
 
     @property
     def visited(self):
@@ -48,7 +55,9 @@ class StateCVRPTW(NamedTuple):
             lengths=self.lengths[key],
             cur_coord=self.cur_coord[key],
             cur_arrival_time=self.cur_arrival_time[key],
-            violated_tw_num=self.violated_tw_num[key],
+            clock=self.clock[key],
+            lateness=self.lateness[key],
+            n_late=self.n_late[key],
             vehicle_speed=self.vehicle_speed[key]
         )
 
@@ -57,7 +66,7 @@ class StateCVRPTW(NamedTuple):
     #     return len(self.used_capacity)
 
     @staticmethod
-    def initialize(input, visited_dtype=torch.uint8):
+    def initialize(input, visited_dtype=torch.uint8, hard=False, legacy=False):
 
         depot = input['depot'] # (batch_size, 2)
         loc = input['loc'] # (batch_size, 20, 2)
@@ -85,9 +94,13 @@ class StateCVRPTW(NamedTuple):
             cur_coord=input['depot'][:, None, :],  # Add step dimension (batch_size, 1, 2)
             i=torch.zeros(1, dtype=torch.int64, device=loc.device),  # Vector with length num_steps
             cur_arrival_time = torch.zeros(batch_size, 1, device=loc.device), # (batch_size, 1)
-            violated_tw_num = torch.zeros(batch_size, 1, device=loc.device), # (batch_size, 1)
+            clock = torch.zeros(batch_size, 1, device=loc.device), # (batch_size, 1)
+            lateness = torch.zeros(batch_size, 1, device=loc.device), # (batch_size, 1)
+            n_late = torch.zeros(batch_size, 1, device=loc.device), # (batch_size, 1)
             # 将车辆的速度转化为张量，形状为(batch_size, 1)
-            vehicle_speed = torch.full((batch_size, 1), StateCVRPTW.VEHICLE_SPEED, dtype=torch.float, device=loc.device) # (batch_size, 1)
+            vehicle_speed = torch.full((batch_size, 1), StateCVRPTW.VEHICLE_SPEED, dtype=torch.float, device=loc.device), # (batch_size, 1)
+            hard=hard,
+            legacy=legacy
         )
 
     def get_final_cost(self):
@@ -105,8 +118,7 @@ class StateCVRPTW(NamedTuple):
         4. 已行驶的路径长度lengths
         5. 当前节点的坐标cur_coord
         6. 更新步数i
-        7. 当前节点的到达时间cur_arrival_time
-        8. 违反时间窗的客户数量violated_tw_num
+        7. 到达时刻（算法1）、累计迟到时长和迟到客户数
         :param selected: (batch_size, 1)
         :return: StateCVRPTW
         """
@@ -124,15 +136,28 @@ class StateCVRPTW(NamedTuple):
         selected_demand = self.demand[self.ids, torch.clamp(prev_a - 1, 0, n_loc - 1)] # 当前节点的需求 (batch_size, 1)
         used_capacity = (self.used_capacity + selected_demand) * (prev_a != 0).float() # 行驶到当前节点时，已使用的容量 (batch_size, 1)
 
-        cur_arrival_time = self.cur_arrival_time + prev_to_cur_length/self.VEHICLE_SPEED # 当前节点的到达时间 (batch_size, 1)
+        """
+        算法1：T_a' = max(T_a + D/S_v, x^s)，早到则等待至时间窗开启；选择仓库时开始一条新路径（一辆新车），T_a' = 0。
+        时间以小时计，迟到量为 max(0, T_a' - x^t)。仓库没有时间窗。
+        """
+        is_depot = prev_a == 0
+        selected_tw = self.tw[self.ids, torch.clamp(prev_a - 1, 0, n_loc - 1)] * self.WORK_TIME # 当前节点的时间窗（小时） (batch_size, 1, 2)
+        arrival = self.clock + prev_to_cur_length / self.vehicle_speed # (batch_size, 1)
+        clock = torch.where(is_depot, torch.zeros_like(arrival), torch.max(arrival, selected_tw[:, :, 0]))
+        late = torch.where(is_depot, torch.zeros_like(clock), torch.clamp(clock - selected_tw[:, :, 1], min=0))
+        lateness = self.lateness + late
+        n_late = self.n_late + (late > self.LATE_EPS).float()
 
-        selected_tw = self.tw[self.ids, torch.clamp(prev_a - 1, 0, n_loc - 1)] # 当前节点的时间窗 (batch_size, 1, 2)
-        """
-        如果到达当前节点的时间cur_arrival_time小于时间窗的左边界，则需要等待到时间窗的左边界，即cur_arrival_time = 时间窗的左边界；
-        如果cur_arrival_time大于时间窗的右边界，则违反时间窗。
-        """
-        cur_arrival_time = torch.where(cur_arrival_time < selected_tw[:, :, 0], selected_tw[:, :, 0], cur_arrival_time)
-        violated_tw_num = torch.where(cur_arrival_time > selected_tw[:, :, 1], self.violated_tw_num + 1, self.violated_tw_num)
+        if self.legacy:
+            """
+            旧版实现：小时与归一化时间窗混比，回仓库后不清零，在仓库处取客户1的时间窗。
+            只用于加载旧模型做回归检验，掩码与成本仍按算法1的clock计算。
+            """
+            old_tw = self.tw[self.ids, torch.clamp(prev_a - 1, 0, n_loc - 1)]
+            cur_arrival_time = self.cur_arrival_time + prev_to_cur_length / self.VEHICLE_SPEED
+            cur_arrival_time = torch.where(cur_arrival_time < old_tw[:, :, 0], old_tw[:, :, 0], cur_arrival_time)
+        else:
+            cur_arrival_time = clock
 
         if self.visited_.dtype == torch.uint8:
             visited_ = self.visited_.scatter(-1, prev_a[:, :, None], 1) # 将当前节点记录到已访问的节点visited_中 (batch_size, 1, n_loc + 1)
@@ -143,7 +168,7 @@ class StateCVRPTW(NamedTuple):
         return self._replace(
             prev_a=prev_a, used_capacity=used_capacity, visited_=visited_,
             lengths=lengths, cur_coord=cur_coord, i=self.i + 1,
-            cur_arrival_time=cur_arrival_time, violated_tw_num=violated_tw_num
+            cur_arrival_time=cur_arrival_time, clock=clock, lateness=lateness, n_late=n_late
         )
 
     def all_finished(self):
@@ -157,10 +182,11 @@ class StateCVRPTW(NamedTuple):
 
     def get_mask(self):
         """
-        得到一个(batch_size, n_loc + 1)的掩码，其中0表示可行动作，1表示不可行动作
-        loc节点已被访问或loc节点的demand加上已使用的容量大于车辆容量时，则该节点不可行
-        depot节点不能连续访问，除非所有节点都已访问
-        :return: mask：(batch_size, n_loc + 1)
+        得到一个(batch_size, 1, n_loc + 1)的掩码，其中0表示可行动作，1表示不可行动作
+        软约束模式（公式18）：loc节点已被访问或loc节点的demand加上已使用的容量大于车辆容量时，该节点不可行
+        硬掩码模式（公式19）：另外，若 T_a + D(n_c, x_i)/S_v > x_i^t，即到达时已迟到，该节点不可行
+        depot节点在车辆已在仓库且仍有客户可选时不可选，其余情况可选
+        :return: mask：(batch_size, 1, n_loc + 1)
         """
 
         if self.visited_.dtype == torch.uint8:
@@ -174,17 +200,14 @@ class StateCVRPTW(NamedTuple):
         used_capacity (1024, 1)
         """
         exceeds_cap = (self.demand[self.ids, :] + self.used_capacity[:, :, None] > self.VEHICLE_CAPACITY) # (batch_size, 1, n_loc) 已用容量加上该节点的需求会超过车辆容量的节点不可访问
-        """
-        tw (1024, 20, 2)
-        ids (1024, 1)
-        tw[ids, :, 1] (1024, 1, 20)
-        cur_arrival_time (1024, 1)
-        cur_arrival_time[ids] (1024, 1, 1)
-        """
-        # exceeds_tw = (self.tw[self.ids, :, 1] < self.cur_arrival_time[self.ids]) # (batch_size, 1, n_loc) 时间窗的右边界在cur_arrival_time之前的节点不可访问
+        mask_loc = visited_loc.to(exceeds_cap.dtype) | exceeds_cap # (batch_size, 1, n_loc) 不能访问的节点
 
-        # mask_loc = visited_loc.to(exceeds_cap.dtype) | exceeds_cap | exceeds_tw # (batch_size, n_loc) 不能访问的节点
-        mask_loc = visited_loc.to(exceeds_cap.dtype) | exceeds_cap # (batch_size, n_loc) 不能访问的节点
+        if self.hard:
+            # 与update中的运算顺序一致，保证掩码放行的节点在到达时不会被记为迟到
+            dist = (self.coords[self.ids, 1:, :] - self.cur_coord[:, :, None, :]).norm(p=2, dim=-1) # (batch_size, 1, n_loc)
+            arrival = self.clock[:, :, None] + dist / self.vehicle_speed[:, :, None] # (batch_size, 1, n_loc)
+            exceeds_tw = arrival > self.tw[self.ids, :, 1] * self.WORK_TIME # (batch_size, 1, n_loc) 到达时已超过时间窗右边界的节点不可访问
+            mask_loc = mask_loc | exceeds_tw
 
         # Cannot visit the depot if just visited and still unserved nodes
         mask_depot = (self.prev_a == 0) & ((mask_loc == 0).int().sum(-1) > 0)

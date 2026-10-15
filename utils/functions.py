@@ -26,7 +26,8 @@ def load_problem(name):
 
 
 def torch_load_cpu(load_path):
-    return torch.load(load_path, map_location=lambda storage, loc: storage)  # Load on CPU
+    # 检查点中保存了基线模型和优化器等对象，需要 weights_only=False（PyTorch 2.6 起默认为 True）
+    return torch.load(load_path, map_location=lambda storage, loc: storage, weights_only=False)  # Load on CPU
 
 
 def move_to(var, device):
@@ -46,7 +47,7 @@ def _load_model_file(load_path, model):
         os.path.join(
             os.getcwd(),
             load_path
-        ), map_location=lambda storage, loc: storage)
+        ), map_location=lambda storage, loc: storage, weights_only=False)
 
     if isinstance(load_data, dict):
         load_optimizer_state_dict = load_data.get('optimizer', None)
@@ -78,8 +79,7 @@ def load_args(filename):
 
 
 def load_model(path, epoch=None):
-    from nets.attention_model import AttentionModel
-    from nets.pointer_network import PointerNetwork
+    from nets.factory import make_model
 
     if os.path.isfile(path):
         model_filename = path
@@ -89,7 +89,7 @@ def load_model(path, epoch=None):
             epoch = max(
                 int(os.path.splitext(filename)[0].split("-")[1])
                 for filename in os.listdir(path)
-                if os.path.splitext(filename)[1] == '.pt'
+                if os.path.splitext(filename)[1] == '.pt' and filename.startswith('epoch-')
             )
         model_filename = os.path.join(path, 'epoch-{}.pt'.format(epoch))
     else:
@@ -99,29 +99,10 @@ def load_model(path, epoch=None):
 
     problem = load_problem(args['problem'])
 
-    model_class = {
-        'attention': AttentionModel,
-        'pointer': PointerNetwork
-    }.get(args.get('model', 'attention'), None)
-    assert model_class is not None, "Unknown model: {}".format(model_class)
-
-    model = model_class(
-        args['embedding_dim'],
-        args['hidden_dim'],
-        problem,
-        n_encode_layers=args['n_encode_layers'],
-        mask_inner=True,
-        mask_logits=True,
-        normalization=args['normalization'],
-        tanh_clipping=args['tanh_clipping'],
-        checkpoint_encoder=args.get('checkpoint_encoder', False),
-        shrink_size=args.get('shrink_size', None)
-    )
+    model = make_model(args, problem)
     # Overwrite model parameters by parameters to load
     load_data = torch_load_cpu(model_filename)
     model.load_state_dict({**model.state_dict(), **load_data.get('model', {})})
-
-    model, *_ = _load_model_file(model_filename, model)
 
     model.eval()  # Put in eval mode
 

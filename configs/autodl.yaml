@@ -1,0 +1,18 @@
+# 在 AutoDL 等租用的多卡服务器上运行正式实验：设置与 paper.yaml 完全相同，只有三处按服务器调整——
+#   1) 元启发式在服务器的 CPU 上运行，时限也在这台机器上标定（autodl_smoke.yaml 的冒烟阶段完成标定）；
+#   2) 并行进程数按容器的 CPU 配额自动确定：按物理核计（超线程的两个线程算一个核），每个可能同时运行的 GPU 任务占一个，
+#      再留一个余量（每卡 25 核、每卡最多 3 个 GPU 任务时，2 张卡共 18 个）；
+#   3) 硬件检查：表2的计时只在 RTX 5090 上运行，元启发式只在标定时限的 Xeon Platinum 8470Q 上运行（n=50/100 在时限内
+#      还没收敛，结果取决于单核速度）。本机不符时这些任务暂不运行，其余照常；换用其他硬件须先在新硬件上重新标定时限、
+#      重跑已完成的元启发式，再改这里。
+# 运行（命令与说明见 README「在 AutoDL 等租用服务器上运行」）：
+#   python run_all.py --config configs/autodl.yaml --gpus all --tasks-per-gpu 20:3,50:3,100:2
+base: paper.yaml
+
+solvers:
+  workers: auto
+  calibration: results/calibration/time_limits_autodl.json
+
+hardware:
+  timing_gpu: RTX 5090                  # 与 nvidia-smi 显示的型号做子串匹配，不区分大小写
+  solver_cpu: Xeon(R) Platinum 8470Q    # 与 /proc/cpuinfo 的 model name 做子串匹配

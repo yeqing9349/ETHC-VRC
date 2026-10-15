@@ -68,6 +68,11 @@ class WarmupBaseline(Baseline):
             self.alpha = (epoch + 1) / float(self.n_epochs)
             print("Set warmup alpha = {}".format(self.alpha))
 
+    def resume(self, epoch):
+        """续训：检查点只含内层基线，不含预热进度，按已完成的最后一个 epoch（从 0 计）恢复 alpha。
+        否则在预热结束后续训时 alpha 停在 0，后续所有 epoch 都会误用指数基线"""
+        self.alpha = min(1.0, (epoch + 1) / float(self.n_epochs))
+
     def state_dict(self):
         # Checkpointing within warmup stage makes no sense, only save inner baseline
         return self.baseline.state_dict()
@@ -168,7 +173,7 @@ class RolloutBaseline(Baseline):
         else:
             self.dataset = dataset
         print("Evaluating baseline model on evaluation dataset")
-        bl_vals, bl_violated_times, bl_route_lengths = rollout(self.model, self.dataset, self.opts)
+        bl_vals, bl_violated_times, bl_route_lengths, _ = rollout(self.model, self.dataset, self.opts)
         self.bl_vals = bl_vals.cpu().numpy()
         self.bl_violated_times = bl_violated_times.cpu().numpy()
         self.bl_route_lengths = bl_route_lengths.cpu().numpy()
@@ -182,7 +187,7 @@ class RolloutBaseline(Baseline):
         print("Evaluating baseline on dataset...")
         # Need to convert baseline to 2D to prevent converting to double, see
         # https://discuss.pytorch.org/t/dataloader-gives-double-instead-of-float/717/3
-        cost, violated_time, route_length = rollout(self.model, dataset, self.opts)
+        cost = rollout(self.model, dataset, self.opts)[0]
         return BaselineDataset(dataset, cost.view(-1, 1))
         # return BaselineDataset(dataset, rollout(self.model, dataset, self.opts).view(-1, 1))
 
@@ -195,7 +200,7 @@ class RolloutBaseline(Baseline):
     def eval(self, x, c):
         # Use volatile mode for efficient inference (single batch so we do not use rollout function)
         with torch.no_grad():
-            v, _ = self.model(x)
+            v = self.model(x)[0]
 
         # There is no loss
         return v, 0
@@ -207,7 +212,7 @@ class RolloutBaseline(Baseline):
         :param epoch: The current epoch
         """
         print("Evaluating candidate model on evaluation dataset")
-        candidate_vals, candidate_violated_times, candidate_route_lengths = rollout(model, self.dataset, self.opts)
+        candidate_vals, candidate_violated_times, candidate_route_lengths, _ = rollout(model, self.dataset, self.opts)
         candidate_vals = candidate_vals.cpu().numpy()
         candidate_violated_times = candidate_violated_times.cpu().numpy()
         candidate_route_lengths = candidate_route_lengths.cpu().numpy()
@@ -218,6 +223,7 @@ class RolloutBaseline(Baseline):
 
         print("Epoch {} candidate mean {}, candidate_avg_violated_time {}, candidate_avg_route_length {}, baseline epoch {} mean {}, difference {}".format(
             epoch, candidate_mean, candidate_avg_violated_time, candidate_avg_route_length, self.epoch, self.mean, candidate_mean - self.mean))
+        self.last_p, self.last_updated = None, False
         if candidate_mean - self.mean < 0:
             # Calc p value
             t, p = ttest_rel(candidate_vals, self.bl_vals)
@@ -225,9 +231,11 @@ class RolloutBaseline(Baseline):
             p_val = p / 2  # one-sided
             assert t < 0, "T-statistic should be negative"
             print("p-value: {}".format(p_val))
+            self.last_p = float(p_val)
             if p_val < self.opts.bl_alpha:
                 print('Update baseline')
                 self._update_model(model, epoch)
+                self.last_updated = True
 
     def state_dict(self):
         return {

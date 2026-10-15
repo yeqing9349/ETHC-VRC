@@ -1,0 +1,67 @@
+# 论文全部实验的唯一配置（表2、图3–6、正文统计）。运行：
+#   uv run python run_all.py --config configs/paper.yaml
+# 设置均取自论文第5.1节；每个任务的输出存在即跳过，中断后重新运行会从断点继续。
+name: paper
+
+paths:
+  outputs: outputs/paper          # 训练好的模型
+  results: results/paper          # 评估与求解结果、表、图、paper_numbers.json
+
+data:
+  test: data/cvrptw/cvrptw{size}_test_seed1234.pkl          # NumPy 随机数，种子 1234
+  val: data/cvrptw/cvrptw{size}_validation_seed4321.pkl     # NumPy 随机数，种子 4321
+  num_test: 10000
+
+sizes: [20, 50, 100]              # 训练规模（表2、图3、图5、图6）
+test_sizes: [20, 30, 50, 70, 100] # 图4 的测试规模
+lambdas: [1, 3, 5, 7, 9]          # 图3：每个 λ 单独训练一个模型；β = λ·T_w，主实验 λ = 3
+seeds: [1234, 1235, 1236]         # 消融的 3 个种子，第一个为主模型的训练种子
+
+train:                            # 论文第5.1.2节，DRL 方法共用
+  n_epochs: 100
+  epoch_size: 1280000             # 每个 epoch 重新生成 1,280,000 个实例（PyTorch 随机数）
+  batch_size: 512                 # 每个 epoch 2,500 次迭代
+  val_size: 10000
+  lr: 1.0e-4
+  max_grad_norm: 1.0
+  bl_alpha: 0.05                  # rollout 基线的配对 t 检验显著性水平
+  bl_warmup_epochs: 1             # 第一个 epoch 用指数移动平均基线预热，之后用贪心 rollout 基线（Kool et al. 的实现，与原始实验相同）
+  exp_beta: 0.8                   # 预热所用指数基线的衰减系数
+  eval_batch_size: 1024
+  log_step: 50
+  tf32: false
+
+models:                           # 各模型的结构参数（其余取 options.py 的默认值）
+  ethc: {n_encode_layers: 3, n_heads: 8, embedding_dim: 128}
+  ethc_woet: {n_encode_layers: 3, n_heads: 8, embedding_dim: 128}
+  tpa: {n_encode_layers: 3, n_heads: 8, embedding_dim: 128, tpa_vehicle_ratio: 0.1}
+  mvmoe: {mvmoe_encode_layers: 6, n_heads: 8, embedding_dim: 128, mvmoe_experts: 4, mvmoe_topk: 2}
+
+eval:
+  greedy_batch: 1024              # ETHC-VRC(G) 与 DRL 基线：每批 1,024 个实例
+  samples: 1280                   # ETHC-VRC(S)：每种掩码模式每个实例 1,280 个样本
+  instances_per_pass: 1           # 每个实例的样本在一次批量前向中完成（论文的计时口径）
+  fig6_instances: 9
+  seed: 1234
+
+solvers:
+  methods: [ortools, ts, ba]
+  max_routes: 12                  # 车队 12 辆
+  workers: 12                     # 并行进程数（i7-12700 的物理核数）
+  time_limit: null                # null：读取标定结果（时限留有余量）
+  calibration: results/calibration/time_limits.json
+  calibrate:                      # 冒烟阶段标定：OR-Tools 在前 100 个测试实例上的时限梯度
+    limits: [1, 2, 5, 10, 30, 60]
+    num_instances: 100
+    tolerance: 0.001              # 与最长时限的平均成本相差不超过 0.1%
+    margin: 2.0                   # 再乘 2 作为余量
+  ts: {tenure_min: 7, tenure_max: 15}
+  ba: {ns: 30, m: 10, e: 3, nep: 15, nsp: 5, ngh: 4, stlim: 500, scout: random}
+
+experiments:
+  table2: true
+  fig3: true
+  fig4: true
+  ablation: true
+  fig6: true
+  solvers: true

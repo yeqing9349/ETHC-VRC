@@ -1,0 +1,12 @@
+# 本地环境
+.venv/
+__pycache__/
+*.pyc
+
+# run_all.py 的运行产物（模型、评估与求解结果、日志）；元启发式时限的标定结果随代码保存，正式运行直接读取
+outputs/paper/
+outputs/smoke/
+results/*
+!results/calibration/
+results/calibration/*
+!results/calibration/time_limits.json
