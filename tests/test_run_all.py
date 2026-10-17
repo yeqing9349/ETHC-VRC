@@ -1,11 +1,13 @@
 """
-编排与续跑的测试：按规模分配每卡任务数、硬件检查、防重复启动的锁、原子写入、续训时截断日志、估算的墙钟时间。
+编排与续跑的测试：按规模分配每卡任务数、硬件检查、防重复启动的锁、原子写入、续训时截断日志、估算的墙钟时间、
+4 台机器分担时的任务拆分。
 调度测试用只睡眠、写结果文件的假任务，不需要显卡。
 运行：uv run pytest -q
 """
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -52,7 +54,7 @@ def test_gpu_task_size_and_hardware_requirements():
     assert hardware_requirement(cfg, tasks['solve:ortools_n50_l1']) == ('solver_cpu', 'Xeon(R) Platinum 8470Q')
     assert hardware_requirement(cfg, tasks['solve:ortools_eq_n100_l3']) == ('solver_cpu', 'Xeon(R) Platinum 8470Q')
     timing = [t for t in tasks.values() if t.stage == 'timing']
-    assert len(timing) == 12 and all(hardware_requirement(cfg, t) == ('timing_gpu', 'RTX 5090') for t in timing)
+    assert len(timing) == 18 and all(hardware_requirement(cfg, t) == ('timing_gpu', 'RTX 5090') for t in timing)
     assert hardware_requirement(cfg, tasks['train:ethc_n100_l3_s1234']) is None
     assert hardware_requirement(load_config('configs/paper.yaml', gpu_slots=1), tasks['solve:ortools_n50_l1']) is None
     assert hardware_matches('RTX 5090', ['NVIDIA GeForce RTX 5090', 'NVIDIA GeForce RTX 5090'])
@@ -83,6 +85,23 @@ def test_per_size_slots(tmp_path, monkeypatch):
             assert sum(units[tasks[tid].meta['size']] for tid in on) <= 6
             peak = max(peak, len(on))
     assert peak >= 2  # 同一张卡上确实同时运行了多个任务
+
+
+def test_priority_and_solo(tmp_path, monkeypatch):
+    """优先级数小的先派发；单独占卡的任务放不下时，优先级更低的任务不再上卡，等卡空出来先给它，它运行时卡上没有别的任务"""
+    monkeypatch.setattr(run_all, 'POLL_SECONDS', 0.05)
+    tasks = {}
+    for name, priority, solo in (('late', 2, False), ('first', 0, False), ('solo', 1, True), ('fill', 2, False)):
+        t = fake('train:' + name, 'train', 'gpu', tmp_path / (name + '.json'), size=20, seconds=0.5)
+        t.priority, t.solo = priority, solo
+        tasks[t.id] = t
+    failed = run_all.run(make_cfg(tmp_path), tasks, set(tasks), ['0'], parse_tasks_per_gpu('20:3'))
+    assert not failed
+    rec = {tid.split(':')[1]: json.load(open(t.marker)) for tid, t in tasks.items()}
+    # 'first' 先上卡；'solo' 等它跑完后单独运行，两个低优先级的任务排在 'solo' 之后（卡上本来还放得下它们）
+    assert rec['first']['end'] <= rec['solo']['start']
+    assert rec['solo']['end'] <= min(rec['late']['start'], rec['fill']['start'])
+    assert rec['late']['start'] < rec['fill']['end'] and rec['fill']['start'] < rec['late']['end']  # 二者共卡并行
 
 
 def test_hardware_holds_and_dependents(tmp_path, monkeypatch):
@@ -191,3 +210,49 @@ def test_wall_clock_per_size():
     packed = wall_clock(per_task, 1, 1, parse_tasks_per_gpu('20:3,100:2'), {20: 2.0, 100: 1.5})
     assert packed['gpu'] == pytest.approx(6 * 9 / 2.0 + 2 * 30 / 1.5)
     assert packed['longest_task'] == pytest.approx(30 * 2 / 1.5)
+
+
+def test_autodl_shards():
+    """scripts/autodl_shard.sh 的 4 份：每个训练、评估与求解任务恰好在一台机器上（试点已完成的三个 n=20 求解除外），
+    评估与其模型在同一台，试点的三个模型在 1 号机"""
+    text = open('scripts/autodl_shard.sh', encoding='utf-8').read()
+    shards = dict(re.findall(r"^SHARD_(\d)='([^']+)'$", text, re.M))
+    assert sorted(shards) == ['1', '2', '3', '4']
+    tasks = build_tasks(load_config('configs/autodl.yaml', gpu_slots=6))
+    owner = {}
+    for k, pattern in shards.items():
+        for tid, t in tasks.items():
+            if t.stage in ('train', 'eval', 'solve') and re.search(pattern, tid):
+                assert tid not in owner, tid
+                owner[tid] = k
+    pilot = {'solve:ortools_n20_l3', 'solve:ts_n20_l3', 'solve:ba_n20_l3'}
+    assert set(owner) == {tid for tid, t in tasks.items() if t.stage in ('train', 'eval', 'solve')} - pilot
+    assert all(owner[d] == owner[tid] for tid in owner for d in tasks[tid].deps if d in owner)
+    assert {owner['train:{}_n20_l3_s1234'.format(v)] for v in ('ethc', 'tpa', 'mvmoe')} == {'1'}
+    # 表2的元启发式分在三台上同时跑，n=50、n=100 的对比才能与模型训练差不多同时出来
+    for n in (50, 100):
+        assert len({owner['solve:{}_n{}_l3'.format(m, n)] for m in ('ortools', 'ts', 'ba')}) == 3
+
+
+def test_compare_reads_several_directories(tmp_path, capsys):
+    """analysis/compare.py：依次在各台的结果目录中查找表2各行，给出本方法相对各基线的配对比较"""
+    import numpy as np
+    from analysis import compare
+    base = 7 + np.random.default_rng(0).random(500)
+    files = {'a': {'eval/ethc_n20_l3_s1234__test20__greedy_soft-hard': base + 0.1,
+                   'eval/ethc_n20_l3_s1234__test20__sample_soft-hard_1280': base - 0.2},
+             'b': {'solvers/ortools_n20_l3': base}}
+    for d, items in files.items():
+        for name, cost in items.items():
+            path = str(tmp_path / d / name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            np.savez(path + '.npz', best_cost=cost)
+            save_json({'best': {'cost': float(cost.mean()), 'feasibility_rate': 1.0}}, path + '.json')
+    argv = ['--config', 'configs/paper.yaml', '--size', '20', '--results', str(tmp_path / 'a'), str(tmp_path / 'b')]
+    assert compare.main(argv) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert any(re.match(r'TPA-Reward\(G\)\s+missing$', line) for line in lines)
+    s = next(line for line in lines if line.startswith('ETHC-VRC(S)') and ' vs OR-Tools' in line)
+    g = next(line for line in lines if line.startswith('ETHC-VRC(G)') and ' vs OR-Tools' in line)
+    assert s.split()[3].startswith('-') and s.endswith('lower')
+    assert g.split()[3].startswith('+') and g.endswith('higher')

@@ -40,16 +40,20 @@ def test_solvers_and_dependencies(paper):
     equal = [t for t in tasks.values() if t.stage == 'equal_time']
     assert sorted(t.meta['size'] for t in equal) == list(cfg.sizes)
     for t in equal:
-        assert t.deps == ['eval:ethc_n{0}_l3_s1234__test{0}__sample_soft-hard_1280'.format(t.meta['size'])]
+        assert t.deps == ['eval:ethc_n{0}_l3_s1234__test{0}__sample_soft-hard_1280_timing'.format(t.meta['size'])]
     for t in tasks.values():
         for d in t.deps:
             assert d in tasks, (t.id, d)
     timing = [t for t in tasks.values() if t.exclusive]
-    assert len(timing) == 12  # 表2：3 个规模 × ETHC-VRC(G)(S)、TPA-Reward(G)、MVMoE(G)
-    assert all(t.stage == 'timing' for t in timing)
+    assert len(timing) == 18  # 表2：3 个规模 × ETHC-VRC(G)(S)、TPA-Reward(G)(S)、MVMoE(G)(S)
+    assert all(t.stage == 'timing' and t.id.endswith('_timing') for t in timing)
     others = {tid for tid, t in tasks.items() if t.stage in ('train', 'eval', 'solve') and not t.exclusive}
     for t in timing:
         assert others <= set(t.deps)
+        # 成本取同名（去掉 _timing）的评估：它只依赖模型，模型训练完就运行
+        q = tasks[t.id[:-len('_timing')]]
+        assert q.stage == 'eval' and not q.exclusive and q.deps == t.deps[:1] and '--timing' not in q.cmd
+        assert [a for a in q.cmd if a != q.marker[:-5]] == [a for a in t.cmd if a not in (t.marker[:-5], '--timing')]
 
 
 def test_paper_settings(paper):
@@ -64,6 +68,40 @@ def test_paper_settings(paper):
     assert '--samples 1280' in s and '--instances_per_pass 1' in s and '--modes soft hard' in s
     g = ' '.join(tasks['eval:ethc_n100_l3_s1234__test100__greedy_soft-hard'].cmd)
     assert '--eval_batch_size 1024' in g
+    # 同预算采样：两个 DRL 基线在各自的掩码模式下每个实例采样 2560 个解，与表2的其他评估一样计时
+    for variant, mode in (('tpa', 'soft'), ('mvmoe', 'hard')):
+        t = tasks['eval:{}_n100_l3_s1234__test100__sample_{}_2560'.format(variant, mode)]
+        b = ' '.join(t.cmd)
+        assert '--samples 2560' in b and '--instances_per_pass 1' in b and '--timing' not in b
+        assert '--modes {} --num_instances'.format(mode) in b
+        assert not t.exclusive and t.deps == ['train:{}_n100_l3_s1234'.format(variant)]
+        timed = tasks[t.id + '_timing']
+        assert timed.exclusive and '--timing' in timed.cmd and timed.deps[0] == t.deps[0]
+
+
+def test_schedule(paper):
+    """派发顺序：表2按规模从小到大 → 多种子消融、图4、图6 → λ 扫描 → 表2计时、等时比较与汇总；
+    n=50、n=100 表2的 ETHC-VRC 与 MVMoE 训练单独占卡"""
+    cfg, tasks = paper
+    p = {tid: t.priority for tid, t in tasks.items()}
+    t2 = [[p[tid] for tid in ('train:ethc_n{}_l3_s1234'.format(n), 'train:tpa_n{}_l3_s1234'.format(n),
+                              'eval:mvmoe_n{0}_l3_s1234__test{0}__sample_hard_2560'.format(n),
+                              'solve:ortools_n{}_l3'.format(n), 'solve:ba_n{}_l3'.format(n))] for n in cfg.sizes]
+    assert all(len(set(row)) == 1 for row in t2) and t2[0][0] < t2[1][0] < t2[2][0]
+    ablation = {p['train:ethc_n20_l3_s1235'], p['train:ethc_woet_n100_l3_s1234'],
+                p['eval:ethc_n50_l3_s1234__test50__sample_soft_2560'],
+                p['eval:ethc_n20_l3_s1234__test100__greedy_soft-hard'],  # 图4
+                p['eval:ethc_n100_l3_s1234__test100__sample_soft-hard_1280_fig6']}
+    fig3 = {p['train:ethc_n100_l9_s1234'], p['eval:tpa_n20_l1_s1234__test20__greedy_soft'], p['solve:ortools_n50_l7']}
+    final = {t.priority for t in tasks.values() if t.stage in ('timing', 'equal_time', 'analysis')}
+    assert len(ablation) == len(fig3) == len(final) == 1
+    assert t2[2][0] < min(ablation) < min(fig3) < min(final)
+    assert p['data'] == p['calibrate'] < t2[0][0]
+    assert {tid for tid, t in tasks.items() if t.solo} == {
+        'train:{}_n{}_l3_s1234'.format(v, n) for v in ('ethc', 'mvmoe') for n in (50, 100)}
+    flat = load_config('configs/paper.yaml')
+    flat.schedule = None  # 没有 schedule 段时都为 0，只按预计时长派发
+    assert {(t.priority, t.solo) for t in build_tasks(flat).values()} == {(0, False)}
 
 
 def test_environment_record():

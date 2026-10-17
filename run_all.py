@@ -8,7 +8,8 @@
 paper_numbers.json）。输出文件已存在的任务自动跳过；中断后重新运行同一条命令即从断点继续（训练从上一个 epoch 的检查点，
 元启发式从最近一次保存的进度，评估从头重做）。GPU 任务按 --gpus 与 --tasks-per-gpu 分到各张卡；CPU 任务（元启发式，
 自带多进程）同一时间只跑一个，与 GPU 任务并行。计时任务（冒烟阶段的计时探针、表2的计时评估）独占运行，不与其他任务并行，
-避免 CPU 争用影响计时。
+避免 CPU 争用影响计时。派发按配置 schedule 段的优先级（数小的先，同一级里预计时长长的先），schedule.solo 匹配的任务
+单独占一张卡。
 
 保护：
 - 同一配置同时只允许一个 run_all.py 运行（锁文件 results/<配置名>/run_all.lock，由编排进程和它启动的任务共同持有）：
@@ -48,7 +49,8 @@ STAGES = ('data', 'probe', 'calibrate', 'train', 'eval', 'solve', 'timing', 'equ
 POLL_SECONDS = 2  # 调度循环的间隔
 
 
-# 调度用的相对耗时（RTX 4060 Ti 上实测的 100 个 epoch 训练小时数，n = 20/50/100）：先派发最长的任务，减少多卡运行末尾的空闲
+# 调度用的相对耗时（RTX 4060 Ti 上实测的 100 个 epoch 训练小时数，n = 20/50/100）：同一优先级里先派发最长的任务，
+# 减少多卡运行末尾的空闲
 TRAIN_HOURS = {'ethc': (11.2, 30.1, 84.2), 'ethc_woet': (11.0, 30.6, 89.0), 'tpa': (5.9, 13.5, 32.3),
                'mvmoe': (20.1, 40.3, 91.0)}
 SAMPLE_SECONDS = (0.11, 0.31, 0.82)  # ETHC-VRC(S) 每实例耗时（两种模式各 1280 个样本）
@@ -264,20 +266,25 @@ def run(cfg, tasks, selected, gpu_ids, policy, held=(), lock_fd=None):
                     del todo[tid]
             # 启动依赖已满足的任务；有就绪的独占任务时不再启动其他任务，等正在运行的任务结束后单独运行它
             ready = [tid for tid, t in todo.items() if all(is_done(tasks[d]) for d in t.deps)]
-            ready.sort(key=lambda tid: -expected_hours(tasks[tid]))  # 最长的任务先运行
+            ready.sort(key=lambda tid: (tasks[tid].priority, -expected_hours(tasks[tid])))  # 优先级高的、最长的先运行
             exclusive_ready = [tid for tid in ready if tasks[tid].exclusive]
             if any(tasks[tid].exclusive for tid in running):
                 ready = []
             elif exclusive_ready:
                 ready = exclusive_ready[:1] if not running else []
+            blocked = None  # 单独占卡的任务放不下时，优先级更低的 GPU 任务不再上卡，让卡空出来给它
             for tid in ready:
                 t = tasks[tid]
                 if t.exclusive and running:
                     break
                 if t.resource == 'gpu':
-                    need = units if t.exclusive else units // tasks_per_gpu_for(policy, gpu_task_size(t))
+                    if blocked is not None and t.priority > blocked:
+                        continue
+                    need = units if (t.exclusive or t.solo) else units // tasks_per_gpu_for(policy, gpu_task_size(t))
                     fits = [g for g in free if free[g] >= need]
                     if not fits:
+                        if t.solo and blocked is None:
+                            blocked = t.priority
                         continue  # 放不下这个任务时，较小的任务仍可填进卡的空余
                     gpu = max(fits, key=lambda g: free[g])  # 最空的卡：最先派发的长任务分散到不同的卡上
                     free[gpu] -= need
@@ -290,7 +297,7 @@ def run(cfg, tasks, selected, gpu_ids, policy, held=(), lock_fd=None):
                 running[tid] = (proc, log, slot, time.time())
                 del todo[tid]
                 print('[{}] start  {}{}{}'.format(stamp(), tid, '' if slot == 'cpu' else ' (GPU {})'.format(slot[0]),
-                                                  ' [exclusive]' if t.exclusive else ''))
+                                                  ' [exclusive]' if t.exclusive else ' [solo]' if t.solo else ''))
                 if lock_fd is not None:
                     write_lock_info(lock_fd, running)
                 if t.exclusive:

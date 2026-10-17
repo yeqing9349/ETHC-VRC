@@ -3,6 +3,8 @@
 所有数字都从 run_all.py 产生的结果文件计算，口径与论文第5.1.1节一致：
 - Gap：相对本表各规模的最优值；
 - 配对比较：逐实例差值的均值相对后一方法的平均成本，配对 t 分布的 95% 置信区间，双侧 Wilcoxon 符号秩检验；
+- 同预算采样：TPA-Reward(S)、MVMoE(S) 每个实例采样 2×samples 个解，与 ETHC-VRC(S) 的候选数相同；
+- 表2的 DRL 行：成本取模型训练完后运行的评估，时间取其他任务都完成后独占重跑的计时评估（任务名带 _timing）；
 - 消融：三个种子上逐实例相对差的均值、按测试实例的 95% 置信区间与种子间标准差。
 
 用法：uv run python -m analysis.report --config configs/paper.yaml
@@ -19,7 +21,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt  # noqa: E402
 
-from experiments import load_config, eval_out, solve_out, run_dir, MAIN_LAMBDA, fmt_lambda  # noqa: E402
+from experiments import load_config, eval_out, solve_out, run_dir, MAIN_LAMBDA, fmt_lambda, baseline_samples  # noqa: E402
 
 # ---- 图表样式：纸面印刷，白底；每个方法在所有图中颜色固定，另以标记形状区分（色觉安全的第二编码） ----
 INK, INK_2, GRID = '#0b0b0b', '#52514e', '#e4e3df'
@@ -125,8 +127,10 @@ def full_metrics(entry):
 
 
 # ---------------------------------------------------------------- 表2与正文统计
+# TPA-Reward(S)、MVMoE(S) 是同预算比较（每个实例的候选数与 ETHC-VRC(S) 相同）；
 # 最后一行是等时比较：OR-Tools 的单实例时限取 ETHC-VRC(S) 的实测每实例耗时
-TABLE2_ROWS = ('ETHC-VRC(G)', 'ETHC-VRC(S)', 'TPA-Reward(G)', 'MVMoE(G)', 'OR-Tools', 'TS', 'BA', 'OR-Tools (equal time)')
+TABLE2_ROWS = ('ETHC-VRC(G)', 'ETHC-VRC(S)', 'TPA-Reward(G)', 'MVMoE(G)', 'TPA-Reward(S)', 'MVMoE(S)', 'OR-Tools', 'TS',
+               'BA', 'OR-Tools (equal time)')
 
 
 def table2(res, out_dir):
@@ -134,23 +138,40 @@ def table2(res, out_dir):
     seed = cfg.seeds[0]
     numbers, per_instance = {}, {}
     for size in cfg.sizes:
-        entries = {
-            'ETHC-VRC(G)': res.eval('ethc', size, MAIN_LAMBDA, seed, size, 'greedy', ['soft', 'hard']),
-            'ETHC-VRC(S)': res.eval('ethc', size, MAIN_LAMBDA, seed, size, 'sample', ['soft', 'hard']),
-            'TPA-Reward(G)': res.eval('tpa', size, MAIN_LAMBDA, seed, size, 'greedy', ['soft']),
-            'MVMoE(G)': res.eval('mvmoe', size, MAIN_LAMBDA, seed, size, 'greedy', ['hard']),
+        drl = {  # 表2的 DRL 行：方法、解码策略、掩码模式、每个实例的样本数
+            'ETHC-VRC(G)': ('ethc', 'greedy', ['soft', 'hard'], None),
+            'ETHC-VRC(S)': ('ethc', 'sample', ['soft', 'hard'], None),
+            'TPA-Reward(G)': ('tpa', 'greedy', ['soft'], None),
+            'MVMoE(G)': ('mvmoe', 'greedy', ['hard'], None),
+        }
+        if cfg.experiments.get('baseline_sampling', True):
+            drl['TPA-Reward(S)'] = ('tpa', 'sample', ['soft'], baseline_samples(cfg))
+            drl['MVMoE(S)'] = ('mvmoe', 'sample', ['hard'], baseline_samples(cfg))
+        # 成本取模型训练完后运行的评估；时间取其他任务都完成后独占重跑的计时评估（tag='timing'）
+        entries = {row: res.eval(v, size, MAIN_LAMBDA, seed, size, strategy, modes, samples=k)
+                   for row, (v, strategy, modes, k) in drl.items()}
+        timings = {row: res.eval(v, size, MAIN_LAMBDA, seed, size, strategy, modes, samples=k, tag='timing')
+                   for row, (v, strategy, modes, k) in drl.items()}
+        entries.update({
             'OR-Tools': res.solve('ortools', size, MAIN_LAMBDA),
             'TS': res.solve('ts', size, MAIN_LAMBDA),
             'BA': res.solve('ba', size, MAIN_LAMBDA),
             'OR-Tools (equal time)': res.solve('ortools_eq', size, MAIN_LAMBDA),
-        }
+        })
         for row, e in entries.items():
             if e is None:
                 continue
             summary, arrays = e
-            numbers.setdefault(row, {})[size] = dict(full_metrics(e), time_s=summary['time_s']['total'])
-            if 'time_limit_s' in summary:  # 元启发式：单实例时限与并行进程数
-                numbers[row][size].update(time_limit_s=summary['time_limit_s'], workers=summary['workers'])
+            if row in drl:  # DRL 方法：每实例耗时为整个测试集的总耗时 / 实例数（贪心按批处理摊销）
+                t = timings[row][0] if timings[row] is not None else None
+                total = None if t is None else t['time_s']['total']
+                numbers.setdefault(row, {})[size] = dict(full_metrics(e), time_s=total,
+                                                         time_per_instance_s=None if t is None else total / t['n'])
+                if t is not None:
+                    numbers[row][size]['timing_run_cost'] = t['best']['cost']  # 计时重跑的成本，应与上面的相同
+            else:  # 元启发式：单实例时限与并行进程数
+                numbers.setdefault(row, {})[size] = dict(full_metrics(e), time_s=summary['time_s']['total'],
+                                                         time_limit_s=summary['time_limit_s'], workers=summary['workers'])
             per_instance[(row, size)] = arrays['best_cost']
         g = entries['ETHC-VRC(G)']
         if g is not None:
@@ -160,11 +181,7 @@ def table2(res, out_dir):
                 'hard_selected_share': gs['mode_share']['hard']})
         s = entries['ETHC-VRC(S)']
         if s is not None:
-            numbers['ETHC-VRC(S)'][size].update({
-                'time_per_instance_s': s[0]['time_s']['total'] / s[0]['n'],
-                'hard_selected_share': s[0]['mode_share']['hard']})
-        if g is not None:
-            numbers['ETHC-VRC(G)'][size]['time_per_instance_s'] = g[0]['time_s']['total'] / g[0]['n']
+            numbers['ETHC-VRC(S)'][size]['hard_selected_share'] = s[0]['mode_share']['hard']
     # Gap 相对各规模的最优值
     for size in cfg.sizes:
         best = min((numbers[r][size]['cost'] for r in TABLE2_ROWS if size in numbers.get(r, {})), default=None)
@@ -178,6 +195,9 @@ def table2(res, out_dir):
         for base_name in ('TPA-Reward(G)', 'MVMoE(G)'):
             if ('ETHC-VRC(G)', size) in per_instance and (base_name, size) in per_instance:
                 d['G_vs_' + base_name] = paired(per_instance[('ETHC-VRC(G)', size)], per_instance[(base_name, size)])
+        for base_name in ('TPA-Reward(S)', 'MVMoE(S)'):  # 同预算采样
+            if ('ETHC-VRC(S)', size) in per_instance and (base_name, size) in per_instance:
+                d['S_vs_' + base_name] = paired(per_instance[('ETHC-VRC(S)', size)], per_instance[(base_name, size)])
         for base_name in ('OR-Tools', 'TS', 'BA', 'OR-Tools (equal time)'):
             if ('ETHC-VRC(S)', size) in per_instance and (base_name, size) in per_instance:
                 d['S_vs_' + base_name] = paired(per_instance[('ETHC-VRC(S)', size)], per_instance[(base_name, size)])
@@ -186,6 +206,10 @@ def table2(res, out_dir):
         if size in numbers.get('ETHC-VRC(G)', {}) and size in numbers.get('ETHC-VRC(S)', {}):
             g, s = numbers['ETHC-VRC(G)'][size]['cost'], numbers['ETHC-VRC(S)'][size]['cost']
             d['sampling_gain_pct'] = 100 * (g - s) / g
+        for base in ('TPA-Reward', 'MVMoE'):  # 两个 DRL 基线采样相对各自贪心解码的降幅
+            gb, sb = numbers.get(base + '(G)', {}).get(size), numbers.get(base + '(S)', {}).get(size)
+            if gb is not None and sb is not None:
+                d.setdefault('baseline_sampling_gain_pct', {})[base] = 100 * (gb['cost'] - sb['cost']) / gb['cost']
         derived[size] = d
 
     # CSV 与 LaTeX

@@ -32,7 +32,8 @@ uv run python run_all.py --config configs/paper.yaml --gpus 0,1,2,3
 - 已完成的任务自动跳过；训练和元启发式求解中断后重新运行会从断点继续。同一配置同时只能有一个 `run_all.py` 在运行（锁文件 `results/<配置名>/run_all.lock`）。
 - `--dry-run` 列出任务及状态；`--only train,eval` 只运行指定阶段；`--tasks-per-gpu` 指定每张卡同时运行的 GPU 任务数，可按规模给出（如 `20:3,50:3,100:2`）；`--emit-slurm slurm/` 为算力中心生成 Slurm 作业脚本（每个阶段一个作业数组，按依赖提交）。
 - 全部设置集中在 `configs/paper.yaml`：规模、λ 列表 {1, 3, 5, 7, 9}、消融种子 {1234, 1235, 1236}、训练与评估参数、元启发式参数。
-- 阶段：`data`（数据检查）→ `train` → `eval` → `solve`（OR-Tools、TS、BA，时限读取 `results/calibration/time_limits.json`）→ `timing`（表2的计时评估，独占运行）→ `equal_time`（OR-Tools 以 ETHC-VRC(S) 的实测每实例耗时为时限的等时比较）→ `analysis`。
+- 阶段：`data`（数据检查）→ `train` → `eval` → `solve`（OR-Tools、TS、BA，时限读取 `results/calibration/time_limits.json`）→ `timing`（表2的计时：同规模的评估在其他任务都完成后独占重跑一次，任务名带 `_timing`）→ `equal_time`（OR-Tools 以 ETHC-VRC(S) 的实测每实例耗时为时限的等时比较）→ `analysis`。
+- 派发顺序在 `schedule` 段：表2（按规模从小到大）→ 多种子消融、图4、图6 → λ 扫描，同一级里预计时长长的先跑，空出的卡与 CPU 由后面的任务填上；`schedule.solo` 匹配的训练（n=50、n=100 表2的 ETHC-VRC 与 MVMoE）单独占一张卡。表2各规模的对比因此先出来，可用 `python -m analysis.compare --config configs/paper.yaml --size 50` 查看。
 
 ## 在 AutoDL 等租用服务器上运行
 
@@ -88,6 +89,10 @@ cd /root/autodl-tmp/ETHC-VRC && /root/autodl-tmp/venv/bin/python run_all.py --co
 nvidia-smi                                                    # 显卡占用
 ```
 
+### 没有空闲的 8 卡机器时
+
+可以用 4 台 2 卡机器分担（每台都是 RTX 5090、Xeon Platinum 8470Q、每卡 25 个 CPU 线程）。`scripts/autodl_shard.sh` 把训练、评估与元启发式分成互不依赖的 4 份，评估与其模型在同一台，n=50、n=100 的 OR-Tools、TS、BA 分在三台上同时跑。按冒烟测试的耗时模拟，n=50 的表2结果约第 23 小时齐，n=100 约第 46 小时，多种子消融约第 56 小时，各台约 77–79 小时跑完。某个规模的表2结果出来后，在 1 号机上运行 `autodl_shard.sh compare 规模 …`，拉取其他各台该规模的结果（不合并），对比本方法与各基线。4 份都完成后，把 2–4 号机的结果拉到 1 号机合并，再在 1 号机上运行表2的计时、等时比较与汇总（约 5 小时，计时都在这一台上）。1 号机运行试点模型的评估，须有试点结果。各步的命令见脚本开头。
+
 ### 中断与续跑
 
 重新执行同一条启动命令即从断点继续，已经跑完的任务不会重跑：
@@ -132,14 +137,14 @@ nvidia-smi                                                    # 显卡占用
 | 训练（算法2，REINFORCE + rollout 基线） | `run.py`、`train.py`、`reinforce_baselines.py` |
 | 推理与评估口径（第5.1.1节） | `eval.py` |
 | 基线 | `nets/tpa_reward.py`、`nets/mvmoe.py`、`BaselineMethods/ortools_cvrptw.py`、`tabu_search.py`、`bees_algorithm.py` |
-| 表2、图3–6 与统计检验 | `analysis/report.py` |
+| 表2、图3–6 与统计检验 | `analysis/report.py`；运行中查看某个规模的表2对比用 `analysis/compare.py` |
 
 ## 论文中未逐项列出的实现细节
 
 - 网络输入：需求与剩余容量 C_r 按车辆容量 C 归一，时间窗按 T_w 归一；解码上下文中的到达时刻 T_a 以小时计，S_v = 2。仓库没有需求和时间窗，由其坐标经单独的线性层嵌入。
 - 公式(14)–(16) 中相邻的线性投影按 Kool et al. 的实现合并（W_Q^g 并入上下文投影，W_Q 并入多头注意力的输出投影），二者数学上等价。
 - 训练：梯度按 L2 范数 1.0 裁剪；第一个 epoch 用指数移动平均基线（衰减系数 0.8）预热，之后用贪心 rollout 基线，与 Kool et al. 的实现及原始实验相同（不预热时第一个 epoch 的基线是未训练的随机策略，软约束模型在这一 epoch 几乎学不到东西）；基线每次更新时重新生成 10,000 个检验实例。`train_log.csv` 每 50 步记录一次训练批次的平均成本，`val_log.csv` 每个 epoch 记录验证集成本与基线检验结果。
-- 评估：贪心解码每批 1,024 个实例；采样时每个实例的 1,280 个样本在一次批量前向中完成，每种掩码模式各用种子 1234 的随机数流。计时任务（表2的时间列）在其他任务完成后独占运行。
+- 评估：贪心解码每批 1,024 个实例；采样时每个实例的 1,280 个样本在一次批量前向中完成，每种掩码模式各用种子 1234 的随机数流。表2另报 TPA-Reward(S) 与 MVMoE(S)：在各自的掩码模式下每个实例采样 2,560 个解，与 ETHC-VRC(S) 两种模式合计的候选数相同，计时口径也相同。表2的成本取模型训练完后运行的评估；时间列由同样的评估在其他任务都完成后独占重跑一次测得（任务名带 `_timing`）。
 - TPA-Reward 与 MVMoE 的结构及其对本文问题的适配写在各自文件开头；二者与 ETHC-VRC 使用同一训练流程与预算。
 - OR-Tools、TS、BA：同一目标（混合成本）、容量硬约束、车队 12 辆、同一单实例时限；时限由 `BaselineMethods/calibrate.py` 标定（取平均成本与最长时限相差不超过 0.1% 的最短时限，再乘 2）。其余参数见 `configs/paper.yaml`。
 
