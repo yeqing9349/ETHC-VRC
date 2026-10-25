@@ -22,11 +22,12 @@
 cd "$(dirname "$0")/.." || exit 1
 PYTHON=${PYTHON:-/root/autodl-tmp/venv/bin/python}
 
-# 各台运行的任务（run_all.py --match 的正则）
-SHARD_1='^((train|eval):(ethc_n100_l(1_s1234|3_s1235)|ethc_n20_l3_s1234|ethc_n50_l1_s1234|mvmoe_n100_l3_s1234|mvmoe_n20_l3_s1234|tpa_n100_l(3_s1234|9_s1234)|tpa_n20_l3_s1234|tpa_n50_l(5_s1234|7_s1234|9_s1234))(__|$)|solve:(ortools_n50_l9|ts_n50_l3)$)'
-SHARD_2='^((train|eval):(ethc_n20_l(3_s1236|7_s1234|9_s1234)|ethc_n50_l(3_s1234|5_s1234|9_s1234)|ethc_woet_n100_l(3_s1234|3_s1236)|ethc_woet_n20_l3_s1234|ethc_woet_n50_l(3_s1234|3_s1235)|tpa_n100_l5_s1234|tpa_n20_l7_s1234)(__|$)|solve:(ba_n50_l3|ortools_n100_l(3|5)|ortools_n50_l1)$)'
-SHARD_3='^((train|eval):(ethc_n100_l(3_s1234|3_s1236)|ethc_n20_l(1_s1234|3_s1235|5_s1234)|ethc_n50_l(3_s1236|7_s1234)|ethc_woet_n20_l(3_s1235|3_s1236)|ethc_woet_n50_l3_s1236|tpa_n100_l(1_s1234|7_s1234)|tpa_n20_l(5_s1234|9_s1234)|tpa_n50_l1_s1234)(__|$)|solve:(ba_n100_l3|ortools_n100_l7|ortools_n20_l(1|5)|ortools_n50_l(5|7))$)'
-SHARD_4='^((train|eval):(ethc_n100_l(5_s1234|7_s1234|9_s1234)|ethc_n50_l3_s1235|ethc_woet_n100_l3_s1235|mvmoe_n50_l3_s1234|tpa_n20_l1_s1234|tpa_n50_l3_s1234)(__|$)|solve:(ortools_n100_l(1|9)|ortools_n20_l(7|9)|ortools_n50_l3|ts_n100_l3)$)'
+# 各台运行的任务（run_all.py --match 的正则）。1 号机的元启发式最先跑完，λ 扫描中 2 号机的 ortools_n50_l1 与 3、4 号机
+# n=20 的 OR-Tools 在运行中改到 1 号机，各台的元启发式差不多同时跑完
+SHARD_1='^((train|eval):(ethc_n100_l(1_s1234|3_s1235)|ethc_n20_l3_s1234|ethc_n50_l1_s1234|mvmoe_n100_l3_s1234|mvmoe_n20_l3_s1234|tpa_n100_l(3_s1234|9_s1234)|tpa_n20_l3_s1234|tpa_n50_l(5_s1234|7_s1234|9_s1234))(__|$)|solve:(ortools_n20_l(1|5|7|9)|ortools_n50_l(1|9)|ts_n50_l3)$)'
+SHARD_2='^((train|eval):(ethc_n20_l(3_s1236|7_s1234|9_s1234)|ethc_n50_l(3_s1234|5_s1234|9_s1234)|ethc_woet_n100_l(3_s1234|3_s1236)|ethc_woet_n20_l3_s1234|ethc_woet_n50_l(3_s1234|3_s1235)|tpa_n100_l5_s1234|tpa_n20_l7_s1234)(__|$)|solve:(ba_n50_l3|ortools_n100_l(3|5))$)'
+SHARD_3='^((train|eval):(ethc_n100_l(3_s1234|3_s1236)|ethc_n20_l(1_s1234|3_s1235|5_s1234)|ethc_n50_l(3_s1236|7_s1234)|ethc_woet_n20_l(3_s1235|3_s1236)|ethc_woet_n50_l3_s1236|tpa_n100_l(1_s1234|7_s1234)|tpa_n20_l(5_s1234|9_s1234)|tpa_n50_l1_s1234)(__|$)|solve:(ba_n100_l3|ortools_n100_l7|ortools_n50_l(5|7))$)'
+SHARD_4='^((train|eval):(ethc_n100_l(5_s1234|7_s1234|9_s1234)|ethc_n50_l3_s1235|ethc_woet_n100_l3_s1235|mvmoe_n50_l3_s1234|tpa_n20_l1_s1234|tpa_n50_l3_s1234)(__|$)|solve:(ortools_n100_l(1|9)|ortools_n50_l3|ts_n100_l3)$)'
 
 merge() {
     # 拷来本机还没有的文件（运行环境记录合并，锁文件不拷），再列出各阶段剩余的任务数
