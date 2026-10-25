@@ -60,8 +60,15 @@ solvers:
 
 experiments:
   table2: true
+  baseline_sampling: true         # 表2、图3、图4 另报 TPA-Reward(S)、MVMoE(S)：每个实例采样 2×samples 个解，与 ETHC-VRC(S) 的候选数相同
   fig3: true
   fig4: true
   ablation: true
   fig6: true
   solvers: true
+
+schedule:                         # run_all.py 的派发顺序（各任务的优先级见 experiments.task_priority）
+  # 数小的先派发，同一级里预计时长长的先跑，空出的卡与 CPU 由后面的任务填上：表2（再按规模从小到大）→ 多种子消融、
+  # 图4、图6 → λ 扫描；表2的计时、等时比较与汇总在最后
+  priority: {table2: 0, ablation: 1, fig4: 1, fig6: 1, fig3: 2}
+  solo: '^train:(ethc|mvmoe)_n(50|100)_l3_s1234$'   # 单独占一张卡：n=50、n=100 表2中最长的两个训练，对比结果早出来

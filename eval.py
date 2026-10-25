@@ -47,6 +47,7 @@ def set_mode(model, decode_type, mask_mode):
 def eval_greedy(model, data, n, mask_mode, opts):
     """一次贪心解码，返回 (n, 5) 逐实例指标与各批的访问序列（留在 GPU 上，计时结束后再用 stack_tours 合并）"""
     set_mode(model, 'greedy', mask_mode)
+    torch.manual_seed(opts.seed)  # MVMoE 的分层门控在贪心解码时也随机抽取分支（与官方实现相同），固定种子使结果可复现
     out, tours = [], []
     with torch.no_grad():
         for start in range(0, n, opts.eval_batch_size):

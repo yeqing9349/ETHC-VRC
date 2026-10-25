@@ -135,6 +135,16 @@ def test_warmup_baseline_resume():
         assert b.alpha == alpha
 
 
+def test_greedy_eval_is_reproducible():
+    """MVMoE 的分层门控在贪心解码时也随机抽取分支，评估器固定随机种子后两次贪心评估的结果相同"""
+    import eval as evaluator
+    model = make_model(args('mvmoe'), CVRPTW).to(DEVICE).eval()
+    input = batch(20, size=10)
+    opts = argparse.Namespace(eval_batch_size=4, seed=1234)
+    runs = [evaluator.eval_greedy(model, input, 10, 'hard', opts)[0] for _ in range(2)]
+    assert torch.equal(runs[0], runs[1])
+
+
 @pytest.mark.parametrize('model_name,mode', [('attention', 'soft'), ('attention', 'hard'), ('tpa', 'soft'),
                                              ('mvmoe', 'hard')])
 def test_eval_saves_tours_matching_metrics(model_name, mode):

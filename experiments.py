@@ -4,6 +4,7 @@
 每个任务是一条命令行；输出文件（marker）存在即视为已完成。
 """
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 
@@ -23,6 +24,8 @@ class Task:
     deps: list = field(default_factory=list)
     meta: dict = field(default_factory=dict)
     exclusive: bool = False  # 计时任务：运行时不与其他任务并行，避免 CPU 争用影响计时
+    priority: int = 0  # 派发优先级：数小的先派发，同一级里预计时长长的先跑（见 task_priority）
+    solo: bool = False  # GPU 任务单独占一张卡，不与其他任务共卡（希望尽早出结果的长训练）
 
 
 def _load_with_base(path):
@@ -323,15 +326,21 @@ def eval_task(cfg, variant, size, lmbda, seed, test_size, strategy, modes, sampl
 
 
 def sample_timing_id(cfg, size):
-    """表2中 ETHC-VRC(S) 的计时评估任务（同规模测试集、λ=3、主种子）"""
+    """表2中 ETHC-VRC(S) 的计时评估任务（同规模测试集、λ=3、主种子；任务名带 _timing）"""
     return 'eval:' + eval_name('ethc', size, MAIN_LAMBDA, cfg.seeds[0], size, 'sample', ['soft', 'hard'],
-                               cfg.eval.samples)
+                               cfg.eval.samples, tag='timing')
+
+
+def baseline_samples(cfg):
+    """TPA-Reward(S)、MVMoE(S) 每个实例的样本数：与 ETHC-VRC(S) 两种掩码模式合计的候选数相同（同预算比较）"""
+    return 2 * cfg.eval.samples
 
 
 def equal_time_limit(cfg, size):
-    """等时比较的单实例时限：本机实测的 ETHC-VRC(S) 每实例耗时（两种模式合计）"""
+    """等时比较的单实例时限：本机计时评估测得的 ETHC-VRC(S) 每实例耗时（两种模式合计）"""
     import json
-    path = eval_out(cfg, 'ethc', size, MAIN_LAMBDA, cfg.seeds[0], size, 'sample', ['soft', 'hard'], cfg.eval.samples)
+    path = eval_out(cfg, 'ethc', size, MAIN_LAMBDA, cfg.seeds[0], size, 'sample', ['soft', 'hard'], cfg.eval.samples,
+                    tag='timing')
     with open(path + '.json', encoding='utf-8') as f:
         s = json.load(f)
     return s['time_s']['total'] / s['n']
@@ -359,11 +368,27 @@ def solve_task(cfg, method, size, lmbda, equal_time=False):
                 deps=deps, meta={'method': name, 'size': size, 'lambda': lmbda, 'equal_time': equal_time})
 
 
+def task_priority(cfg, experiment, size=None):
+    """run_all.py 的派发优先级（数小的先派发）：配置 schedule.priority 给出各实验的级别，表2再按规模从小到大细分，
+    小规模的对比先出来；准备阶段（数据检查、探针、标定）最先，表2的计时、等时比较、汇总与未列出的实验最后。
+    没有 schedule.priority 时都为 0（只按预计时长派发）"""
+    levels = (cfg.get('schedule') or {}).get('priority') or {}
+    if not levels or experiment == 'setup':
+        return 0
+    if experiment not in levels:
+        return 100 * (max(levels.values()) + 1)
+    sub = sorted(cfg.sizes).index(size) + 1 if experiment == 'table2' and size in cfg.sizes else 0
+    return 100 * levels[experiment] + sub
+
+
 def build_tasks(cfg):
     tasks = {}
 
-    def add(task):
-        tasks.setdefault(task.id, task)
+    def add(task, experiment, size=None):
+        """同一任务被几个实验用到时（如主模型），以第一次加入时的实验定优先级"""
+        if task.id not in tasks:
+            task.priority = task_priority(cfg, experiment, size)
+            tasks[task.id] = task
 
     sizes, lambdas, seeds = list(cfg.sizes), list(cfg.lambdas), list(cfg.seeds)
     main_seed = seeds[0]
@@ -373,7 +398,7 @@ def build_tasks(cfg):
     add(Task(id='data', stage='data', resource='cpu',
              cmd=[PY, 'generate_data.py', '--problem', 'cvrptw', '--check', data_check, '--graph_sizes',
                   *map(str, sorted(set(cfg.test_sizes) | set(sizes)))],
-             marker=data_check))
+             marker=data_check), 'setup')
 
     # ---- 冒烟阶段：计时探针 ----
     for probe in cfg.get('probes', []) or []:
@@ -391,7 +416,7 @@ def build_tasks(cfg):
                     cmd.append('--tf32')
                 add(Task(id='probe:' + os.path.basename(out), stage='probe', resource='gpu', cmd=cmd,
                          marker=os.path.join(out, 'probe.json'), exclusive=True,
-                         meta={'variant': variant, 'size': size, 'tf32': bool(probe.get('tf32'))}))
+                         meta={'variant': variant, 'size': size, 'tf32': bool(probe.get('tf32'))}), 'setup')
 
     # ---- 元启发式时限标定（冒烟阶段运行；正式运行时若标定文件已存在则跳过） ----
     if cfg.solvers.get('run_calibration', cfg.solvers.get('time_limit') is None):
@@ -401,62 +426,84 @@ def build_tasks(cfg):
                       '--num_instances', str(c.num_instances), '--tolerance', str(c.tolerance), '--margin', str(c.margin),
                       '--workers', str(cfg.solvers.workers), '--out', calibration_path(cfg),
                       '--dataset_pattern', cfg.data.test],
-                 marker=calibration_path(cfg), meta={'sizes': sizes}))
+                 marker=calibration_path(cfg), meta={'sizes': sizes}), 'setup')
 
     exp = cfg.experiments
     for size in sizes:
-        # ---- 表2：主模型（λ=3，主种子），评估同规模测试集 ----
+        # ---- 表2：主模型（λ=3，主种子）评估同规模测试集；图4：评估其他测试规模 ----
         if exp.table2 or exp.fig4:
+            main_exp = 'table2' if exp.table2 else 'fig4'
             for variant in ('ethc', 'tpa', 'mvmoe'):
-                add(train_task(cfg, variant, size, MAIN_LAMBDA, main_seed))
+                add(train_task(cfg, variant, size, MAIN_LAMBDA, main_seed), main_exp, size)
             test_sizes = list(cfg.test_sizes) if exp.fig4 else [size]
             for t in test_sizes:
-                timing = t == size
-                add(eval_task(cfg, 'ethc', size, MAIN_LAMBDA, main_seed, t, 'greedy', ['soft', 'hard'], timing=timing))
-                add(eval_task(cfg, 'ethc', size, MAIN_LAMBDA, main_seed, t, 'sample', ['soft', 'hard'], timing=timing))
-                add(eval_task(cfg, 'tpa', size, MAIN_LAMBDA, main_seed, t, 'greedy', ['soft'], timing=timing))
-                add(eval_task(cfg, 'mvmoe', size, MAIN_LAMBDA, main_seed, t, 'greedy', ['hard'], timing=timing))
+                which = main_exp if t == size else 'fig4'
+                add(eval_task(cfg, 'ethc', size, MAIN_LAMBDA, main_seed, t, 'greedy', ['soft', 'hard']), which, size)
+                add(eval_task(cfg, 'ethc', size, MAIN_LAMBDA, main_seed, t, 'sample', ['soft', 'hard']), which, size)
+                add(eval_task(cfg, 'tpa', size, MAIN_LAMBDA, main_seed, t, 'greedy', ['soft']), which, size)
+                add(eval_task(cfg, 'mvmoe', size, MAIN_LAMBDA, main_seed, t, 'greedy', ['hard']), which, size)
+                # 同预算采样：TPA-Reward(S)、MVMoE(S) 在各自的掩码模式下每个实例采样 2×samples 个解，与 ETHC-VRC(S) 的
+                # 候选数相同（表2与图4）
+                if exp.get('baseline_sampling', True):
+                    for variant, modes in (('tpa', ['soft']), ('mvmoe', ['hard'])):
+                        add(eval_task(cfg, variant, size, MAIN_LAMBDA, main_seed, t, 'sample', modes,
+                                      samples=baseline_samples(cfg)), which, size)
+            if exp.table2:
+                timed = [('ethc', 'greedy', ['soft', 'hard'], None), ('ethc', 'sample', ['soft', 'hard'], None),
+                         ('tpa', 'greedy', ['soft'], None), ('mvmoe', 'greedy', ['hard'], None)]
+                if exp.get('baseline_sampling', True):
+                    timed += [(variant, 'sample', modes, baseline_samples(cfg))
+                              for variant, modes in (('tpa', ['soft']), ('mvmoe', ['hard']))]
+                # 表2的时间列：上面同规模的评估在其他任务都完成后独占重跑一次计时（任务名带 _timing），汇总只取其中的时间；
+                # 成本取上面的评估，它们在模型训练完后就运行，各规模的对比先出来
+                for variant, strategy, modes, samples in timed:
+                    add(eval_task(cfg, variant, size, MAIN_LAMBDA, main_seed, size, strategy, modes, samples=samples,
+                                  tag='timing', timing=True), 'final')
         # ---- 图3：λ 扫描（每个 λ 单独训练 ETHC 与 TPA-Reward） ----
         if exp.fig3:
             for lmbda in lambdas:
                 for variant in ('ethc', 'tpa'):
-                    add(train_task(cfg, variant, size, lmbda, main_seed))
-                add(eval_task(cfg, 'ethc', size, lmbda, main_seed, size, 'greedy', ['soft', 'hard']))
-                add(eval_task(cfg, 'ethc', size, lmbda, main_seed, size, 'sample', ['soft', 'hard']))
-                add(eval_task(cfg, 'tpa', size, lmbda, main_seed, size, 'greedy', ['soft']))
+                    add(train_task(cfg, variant, size, lmbda, main_seed), 'fig3')
+                add(eval_task(cfg, 'ethc', size, lmbda, main_seed, size, 'greedy', ['soft', 'hard']), 'fig3')
+                add(eval_task(cfg, 'ethc', size, lmbda, main_seed, size, 'sample', ['soft', 'hard']), 'fig3')
+                add(eval_task(cfg, 'tpa', size, lmbda, main_seed, size, 'greedy', ['soft']), 'fig3')
+                # TPA-Reward(S)；MVMoE 训练和推理都用硬掩码、解从不迟到，与 λ 无关，图中只用 λ=3 的模型（表2的评估）
+                if exp.get('baseline_sampling', True):
+                    add(eval_task(cfg, 'tpa', size, lmbda, main_seed, size, 'sample', ['soft'],
+                                  samples=baseline_samples(cfg)), 'fig3')
         # ---- 图5与消融：full 与 w/o ET 各 3 个种子；w/o HC 用 full 的权重单模式采样 2×samples ----
         if exp.ablation:
             for seed in seeds:
                 for variant in ('ethc', 'ethc_woet'):
-                    add(train_task(cfg, variant, size, MAIN_LAMBDA, seed))
-                    add(eval_task(cfg, variant, size, MAIN_LAMBDA, seed, size, 'greedy', ['soft', 'hard']))
-                    add(eval_task(cfg, variant, size, MAIN_LAMBDA, seed, size, 'sample', ['soft', 'hard']))
+                    add(train_task(cfg, variant, size, MAIN_LAMBDA, seed), 'ablation')
+                    add(eval_task(cfg, variant, size, MAIN_LAMBDA, seed, size, 'greedy', ['soft', 'hard']), 'ablation')
+                    add(eval_task(cfg, variant, size, MAIN_LAMBDA, seed, size, 'sample', ['soft', 'hard']), 'ablation')
                 for mode in ('soft', 'hard'):
                     add(eval_task(cfg, 'ethc', size, MAIN_LAMBDA, seed, size, 'sample', [mode],
-                                  samples=2 * cfg.eval.samples))
+                                  samples=2 * cfg.eval.samples), 'ablation')
         # ---- 图6：每个规模前 9 个实例的全部采样解 ----
         if exp.fig6:
             k = cfg.eval.fig6_instances
             add(eval_task(cfg, 'ethc', size, MAIN_LAMBDA, main_seed, size, 'sample', ['soft', 'hard'],
-                          num=k, keep=k, tag='fig6'))
+                          num=k, keep=k, tag='fig6'), 'fig6')
         # ---- 冒烟阶段：评估计时探针（G 跑满 10,000 个实例，S 按论文口径测少量实例的每实例耗时） ----
         probes = cfg.get('eval_probes')
         if probes:
             for variant, modes in (('ethc', ['soft', 'hard']), ('tpa', ['soft']), ('mvmoe', ['hard'])):
                 add(eval_task(cfg, variant, size, MAIN_LAMBDA, main_seed, size, 'greedy', modes,
-                              num=probes.greedy_num, tag='probe', timing=True))
+                              num=probes.greedy_num, tag='probe', timing=True), 'setup')
             for t in probes.test_sizes:
                 add(eval_task(cfg, 'ethc', size, MAIN_LAMBDA, main_seed, t, 'sample', ['soft', 'hard'],
-                              samples=probes.samples, num=probes.sample_num, tag='probe', timing=True))
+                              samples=probes.samples, num=probes.sample_num, tag='probe', timing=True), 'setup')
 
     # ---- 元启发式：表2（λ=3）用 OR-Tools、TS、BA；图3 的 λ 扫描用 OR-Tools ----
     if exp.get('solvers', True):
         for size in sizes:
             for method in cfg.solvers.methods:
-                add(solve_task(cfg, method, size, MAIN_LAMBDA))
+                add(solve_task(cfg, method, size, MAIN_LAMBDA), 'table2' if exp.table2 else 'fig3', size)
             if exp.fig3:
                 for lmbda in lambdas:
-                    add(solve_task(cfg, 'ortools', size, lmbda))
+                    add(solve_task(cfg, 'ortools', size, lmbda), 'fig3')
 
     # ---- 计时评估（表2的时间列）放在其他全部训练、评估与求解任务之后独占运行，此时机器空闲，也不会让其他卡等待 ----
     others = [tid for tid, t in tasks.items() if t.stage in ('calibrate', 'solve', 'train', 'eval') and not t.exclusive]
@@ -468,7 +515,7 @@ def build_tasks(cfg):
     if exp.get('solvers', True) and exp.table2 and cfg.solvers.get('equal_time', True):
         for size in sizes:
             if sample_timing_id(cfg, size) in tasks:
-                add(solve_task(cfg, 'ortools', size, MAIN_LAMBDA, equal_time=True))
+                add(solve_task(cfg, 'ortools', size, MAIN_LAMBDA, equal_time=True), 'final')
 
     # ---- 汇总：表、图与正文数字 ----
     deps = [tid for tid, t in tasks.items() if t.stage in ('eval', 'solve', 'timing', 'equal_time')]
@@ -476,7 +523,13 @@ def build_tasks(cfg):
     add(Task(id='analysis', stage='analysis', resource='cpu',
              cmd=[PY, '-m', 'analysis.report', '--config', cfg.config_path],
              marker=os.path.join(cfg.paths.results, 'paper_numbers.json'), deps=deps,
-             meta={'dep_markers': [tasks[d].marker for d in deps]}))
+             meta={'dep_markers': [tasks[d].marker for d in deps]}), 'final')
+
+    # ---- 单独占卡：配置 schedule.solo（正则表达式）匹配的 GPU 任务不与其他任务共卡，结果早出来 ----
+    solo = (cfg.get('schedule') or {}).get('solo')
+    if solo:
+        for tid, t in tasks.items():
+            t.solo = t.resource == 'gpu' and not t.exclusive and re.search(solo, tid) is not None
     return tasks
 
 
