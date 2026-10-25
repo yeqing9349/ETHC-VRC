@@ -60,7 +60,7 @@ solvers:
 
 experiments:
   table2: true
-  baseline_sampling: true         # 表2 另报 TPA-Reward(S)、MVMoE(S)：每个实例采样 2×samples 个解，与 ETHC-VRC(S) 的候选数相同
+  baseline_sampling: true         # 表2、图3、图4 另报 TPA-Reward(S)、MVMoE(S)：每个实例采样 2×samples 个解，与 ETHC-VRC(S) 的候选数相同
   fig3: true
   fig4: true
   ablation: true

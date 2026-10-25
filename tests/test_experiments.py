@@ -79,6 +79,21 @@ def test_paper_settings(paper):
         assert timed.exclusive and '--timing' in timed.cmd and timed.deps[0] == t.deps[0]
 
 
+def test_baseline_sampling_in_figures(paper):
+    """同预算采样也用于图3（每个 λ 的 TPA-Reward(S)）与图4（每个测试规模的 TPA-Reward(S)、MVMoE(S)）"""
+    cfg, tasks = paper
+    for size in cfg.sizes:
+        for lmbda in cfg.lambdas:
+            t = tasks['eval:tpa_n{0}_l{1}_s1234__test{0}__sample_soft_2560'.format(size, lmbda)]
+            assert t.deps == ['train:tpa_n{}_l{}_s1234'.format(size, lmbda)]
+        for test in cfg.test_sizes:
+            for variant, mode in (('tpa', 'soft'), ('mvmoe', 'hard')):
+                assert 'eval:{}_n{}_l3_s1234__test{}__sample_{}_2560'.format(variant, size, test, mode) in tasks
+    sampled = [tid for tid, t in tasks.items() if t.stage == 'eval' and tid.startswith(('eval:tpa_', 'eval:mvmoe_'))
+               and '__sample_' in tid]
+    assert len(sampled) == 42  # 表2 6 个，图3 另有 12 个（λ ≠ 3），图4 另有 24 个（测试规模 ≠ 训练规模）
+
+
 def test_schedule(paper):
     """派发顺序：表2按规模从小到大 → 多种子消融、图4、图6 → λ 扫描 → 表2计时、等时比较与汇总；
     n=50、n=100 表2的 ETHC-VRC 与 MVMoE 训练单独占卡"""

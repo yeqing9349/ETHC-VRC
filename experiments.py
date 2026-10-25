@@ -442,16 +442,18 @@ def build_tasks(cfg):
                 add(eval_task(cfg, 'ethc', size, MAIN_LAMBDA, main_seed, t, 'sample', ['soft', 'hard']), which, size)
                 add(eval_task(cfg, 'tpa', size, MAIN_LAMBDA, main_seed, t, 'greedy', ['soft']), which, size)
                 add(eval_task(cfg, 'mvmoe', size, MAIN_LAMBDA, main_seed, t, 'greedy', ['hard']), which, size)
-            if exp.table2:
                 # 同预算采样：TPA-Reward(S)、MVMoE(S) 在各自的掩码模式下每个实例采样 2×samples 个解，与 ETHC-VRC(S) 的
-                # 候选数相同；只用于表2（同规模测试集）
+                # 候选数相同（表2与图4）
+                if exp.get('baseline_sampling', True):
+                    for variant, modes in (('tpa', ['soft']), ('mvmoe', ['hard'])):
+                        add(eval_task(cfg, variant, size, MAIN_LAMBDA, main_seed, t, 'sample', modes,
+                                      samples=baseline_samples(cfg)), which, size)
+            if exp.table2:
                 timed = [('ethc', 'greedy', ['soft', 'hard'], None), ('ethc', 'sample', ['soft', 'hard'], None),
                          ('tpa', 'greedy', ['soft'], None), ('mvmoe', 'greedy', ['hard'], None)]
                 if exp.get('baseline_sampling', True):
-                    for variant, modes in (('tpa', ['soft']), ('mvmoe', ['hard'])):
-                        add(eval_task(cfg, variant, size, MAIN_LAMBDA, main_seed, size, 'sample', modes,
-                                      samples=baseline_samples(cfg)), 'table2', size)
-                        timed.append((variant, 'sample', modes, baseline_samples(cfg)))
+                    timed += [(variant, 'sample', modes, baseline_samples(cfg))
+                              for variant, modes in (('tpa', ['soft']), ('mvmoe', ['hard']))]
                 # 表2的时间列：上面同规模的评估在其他任务都完成后独占重跑一次计时（任务名带 _timing），汇总只取其中的时间；
                 # 成本取上面的评估，它们在模型训练完后就运行，各规模的对比先出来
                 for variant, strategy, modes, samples in timed:
@@ -465,6 +467,10 @@ def build_tasks(cfg):
                 add(eval_task(cfg, 'ethc', size, lmbda, main_seed, size, 'greedy', ['soft', 'hard']), 'fig3')
                 add(eval_task(cfg, 'ethc', size, lmbda, main_seed, size, 'sample', ['soft', 'hard']), 'fig3')
                 add(eval_task(cfg, 'tpa', size, lmbda, main_seed, size, 'greedy', ['soft']), 'fig3')
+                # TPA-Reward(S)；MVMoE 训练和推理都用硬掩码、解从不迟到，与 λ 无关，图中只用 λ=3 的模型（表2的评估）
+                if exp.get('baseline_sampling', True):
+                    add(eval_task(cfg, 'tpa', size, lmbda, main_seed, size, 'sample', ['soft'],
+                                  samples=baseline_samples(cfg)), 'fig3')
         # ---- 图5与消融：full 与 w/o ET 各 3 个种子；w/o HC 用 full 的权重单模式采样 2×samples ----
         if exp.ablation:
             for seed in seeds:
